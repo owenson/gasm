@@ -1,4 +1,4 @@
-gasm
-====
+x86 Assembler by Dr Gareth Owen 
 
-x86 Assembler
+NASM compatible.
+Open source licence.
