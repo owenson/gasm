@@ -1,0 +1,5 @@
+gasm
+gasm-asan
+*.bin
+!tests/programs/*.bin
+__pycache__/

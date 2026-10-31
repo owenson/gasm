@@ -1,11 +1,11 @@
-// GASM Source Code, Gareth Owen, gaz@athene.co.uk, http://gasm.cjb.net
-// YOU MUST READ LICENSE.TXT BEFORE USE OF THE SOURCE CODE IS PERMITTED, 
-// IF YOU DO NOT HAVE LICENSE.TXT THEN EITHER GET A COPY OF 
+// GASM Source Code, Gareth Owenson, gareth.owenson@gmail.com
+// YOU MUST READ LICENSE.TXT BEFORE USE OF THE SOURCE CODE IS PERMITTED,
+// IF YOU DO NOT HAVE LICENSE.TXT THEN EITHER GET A COPY OF
 // DELETE THIS SOURCE CODE
 
 /*
 GASM Assembler
-Copyright (C) 1999  Gareth Owen <gaz@athene.co.uk>
+Copyright (C) 1999  Gareth Owenson
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -26,2317 +26,1785 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 #include "gasm.h"
 
-// Prototypes
+typedef long long i64;
 
-int gstrnicmp(char *string1, char *string2, unsigned int n);
-int gstricmp(char *string1, char *string2);
-void gstrlwr(char *string);
+#define MAX_LINE		4096
+#define MAX_PASSES		1000
+#define MAX_INCLUDE_DEPTH	32
+#define MAX_OPERANDS		3
+#define MAX_OUTPUT		(256LL * 1024 * 1024)	// largest output image
 
-t_instruction Parseline(char *orig_line);
-t_dynamic_instruction FindDynamicInstruction(char *ins_name, unsigned int parm1, unsigned int parm2);
-unsigned long Eval2(char *e_string, char brackets, unsigned int evaluated);
-unsigned char FindModRM(unsigned long &modrm_evaluated);
-void GetDisplacement(char *d_string, char *displacement);
+//**************************************
+// Global assembler state
+//**************************************
+t_label labels[MAX_LABELS];
+static int label_count = 0;
 
-void fatal_error(char *error_msg);
-t_instruction Handledesc(char *line);
-char isHex(char *string);
+static unsigned long line_number = 0;	// Current line number of current file
+static i64 offset = 0;			// Current address
+static i64 line_start = 0;		// Address at the start of the current line ($)
+static i64 origin = 0;			// Value set by ORG ($$)
+static int BITS = 16;			// Current default operand/address size
+static int pass_number = 0;		// Current pass
+static int final_pass = FALSE;		// TRUE on the pass that writes output
+static int labels_changed = FALSE;	// Did any label move during this pass?
+static int include_depth = 0;
+static char filename[1024];		// Current source file (for error messages)
+static char last_global[LABEL_NAME_MAX];	// Scope for NASM style .local labels
 
-t_dynamic_instruction AutoModify(unsigned int &parm1_evaluated, unsigned int &parm2_evaluated, char *parm1, char *parm2, char *temp_p);
-t_dynamic_instruction Parm1_Modify(unsigned int &parm1_evaluated, unsigned int &parm2_evaluated, char *parm1, char *parm2, char *temp_p);
-t_dynamic_instruction Parm2_Modify(unsigned int &parm1_evaluated, unsigned int &parm2_evaluated, char *parm1, char *parm2, char *temp_p);
+static unsigned char *outbuf = NULL;	// Output image (built on the final pass)
+static size_t outlen = 0, outcap = 0;
+static i64 emitted = 0;			// bytes generated in this pass
 
-signed long GetRelative(char *address, unsigned long instructionend);
-unsigned char CheckValidLabel(char *label_name);
-unsigned int GetSegment(char *s_string);
-unsigned long GetOffset(char *s_string);
-char Contains(char *c_string, char c);	// Does the character contain c?
-t_fixed_instruction FindFixedInstruction(char *instruction);
-unsigned long SolveEquation(char *equation);
-char isInstruction(char *i_string);
-char isRelativeInstruction(char *instruction);
-void Command(char *line);
-void Preprocessor(char *line);
+//**************************************
+// Error handling
+//**************************************
+static void fatal_error(const char *fmt, ...)
+{
+	va_list ap;
 
-t_instruction Handletimes(char *line);
-t_instruction Handletss(char *line);
+	fprintf(stderr, "%s:%lu: error: ", filename, line_number);
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fprintf(stderr, "\n");
+	exit(1);
+}
 
-char isSegmentRegister(char *seg_reg);
-char SegmentRegister(char *seg_reg);
-char isControlRegister(char *control_reg);
-char ControlRegister(char *control_reg);
-char isDebugRegister(char *debug_reg);
-char DebugRegister(char *debug_reg);
+//**************************************
+// Small string helpers
+//**************************************
+static int gstricmp(const char *a, const char *b)
+{
+	if(!a || !b) return 1;
+	while(*a && *b) if(tolower((unsigned char)*a++) != tolower((unsigned char)*b++)) return 1;
+	return (*a || *b) ? 1 : 0;
+}
 
-void HandleEQU(char *line);
-int remstring(char *str, char *rem);
+static char *trim(char *s)
+{
+	char *e;
 
-unsigned char FindRegister(char *reg);
+	while(*s == ' ' || *s == '\t') s++;
+	e = s + strlen(s);
+	while(e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = '\0';
+	return s;
+}
 
-void ExtractBrackets(char *string);
+static int is_ident_start(int c) { return isalpha(c) || c == '_' || c == '.' || c == '?' || c == '@'; }
+static int is_ident_char(int c) { return isalnum(c) || c == '_' || c == '.' || c == '?' || c == '@' || c == '$' || c == '#' || c == '~'; }
+static int is_quote(int c) { return c == '\'' || c == '"' || c == '`'; }
 
-t_instruction DataType(char *line);
-t_instruction popSeg(char *seg_reg);
-t_instruction pushSeg(char *seg_reg);
-void Parsefile(char writeoutput);
+// Splits s in place at top level commas (not inside quotes, brackets or parentheses).
+static int split_commas(char *s, char **parts, int max_parts)
+{
+	int n = 0, depth = 0;
+	char quote = 0, *start = s;
 
+	if(*trim(s) == '\0') return 0;
+	for(; ; s++)
+	{
+		if(quote)
+		{
+			if(*s == quote) quote = 0;
+			else if(*s == '\0') fatal_error("unterminated string");
+			continue;
+		}
+		if(is_quote(*s)) { quote = *s; continue; }
+		if(*s == '(' || *s == '[') depth++;
+		if(*s == ')' || *s == ']') depth--;
+		if((*s == ',' && depth == 0) || *s == '\0')
+		{
+			int end = (*s == '\0');
+			if(n >= max_parts) fatal_error("too many operands");
+			*s = '\0';
+			parts[n++] = trim(start);
+			if(parts[n-1][0] == '\0') fatal_error("empty operand");
+			if(end) break;
+			start = s + 1;
+		}
+	}
+	return n;
+}
 
-unsigned long line_number = 0;  // Current line number of current file
-unsigned long offset = 0;       // Binary offset (of output file)
-unsigned char pass_number = 1, BITS = 16;  // Current pass
-unsigned int prefixes = 0;
-unsigned char address_override_disable = 0, address_override_force = 0, size_override_force = 0;
+// Removes a trailing comment, respecting quoted strings.
+static void strip_comment(char *s)
+{
+	char quote = 0;
 
-char *temp_p=0;			// Stores instruction, sorry, un-imaginative name :)
-char filename[255];
-FILE *out;
+	for(; *s; s++)
+	{
+		if(quote) { if(*s == quote) quote = 0; continue; }
+		if(is_quote(*s)) quote = *s;
+		else if(*s == ';') { *s = '\0'; return; }
+	}
+}
+
+// If s starts with keyword kw (as a whole word), returns pointer past it, else NULL.
+static char *match_keyword(char *s, const char *kw)
+{
+	size_t n = strlen(kw);
+	size_t i;
+
+	for(i = 0; i < n; i++) if(tolower((unsigned char)s[i]) != kw[i]) return NULL;
+	if(is_ident_char((unsigned char)s[n])) return NULL;
+	return s + n;
+}
+
+//**************************************
+// Registers
+//**************************************
+static const char *reg8_names[]  = { "al", "cl", "dl", "bl", "ah", "ch", "dh", "bh" };
+static const char *reg16_names[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", "di" };
+static const char *reg32_names[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" };
+static const char *sreg_names[]  = { "es", "cs", "ss", "ds", "fs", "gs" };
+static const unsigned char sreg_prefix[] = { 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65 };
+
+enum { RK_NONE, RK_GP, RK_SREG, RK_CREG, RK_DREG };
+
+// Looks up a register name. Returns its kind and sets *num and *size.
+static int lookup_register(const char *name, int *num, int *size)
+{
+	int i;
+
+	for(i = 0; i < 8; i++)
+	{
+		if(!gstricmp(name, reg8_names[i]))  { *num = i; *size = 8;  return RK_GP; }
+		if(!gstricmp(name, reg16_names[i])) { *num = i; *size = 16; return RK_GP; }
+		if(!gstricmp(name, reg32_names[i])) { *num = i; *size = 32; return RK_GP; }
+	}
+	for(i = 0; i < 6; i++) if(!gstricmp(name, sreg_names[i])) { *num = i; *size = 16; return RK_SREG; }
+	if(tolower((unsigned char)name[0]) == 'c' && tolower((unsigned char)name[1]) == 'r' && name[2] >= '0' && name[2] <= '4' && name[2] != '1' && name[3] == '\0')
+		{ *num = name[2] - '0'; *size = 32; return RK_CREG; }
+	if(tolower((unsigned char)name[0]) == 'd' && tolower((unsigned char)name[1]) == 'r' && name[2] >= '0' && name[2] <= '7' && name[3] == '\0')
+		{ *num = name[2] - '0'; *size = 32; return RK_DREG; }
+	return RK_NONE;
+}
+
+//**************************************
+// Labels
+//**************************************
+
+// Expands NASM style local labels (.name) using the last global label.
+static void qualify_label(const char *name, char *out)
+{
+	if(name[0] == '.' && name[1] != '.' && last_global[0])
+	{
+		if(strlen(last_global) + strlen(name) >= LABEL_NAME_MAX) fatal_error("label name too long");
+		sprintf(out, "%s%s", last_global, name);
+	}
+	else
+	{
+		if(strlen(name) >= LABEL_NAME_MAX) fatal_error("label name too long");
+		strcpy(out, name);
+	}
+}
+
+static t_label *Findlabel(const char *label_name)
+{
+	char full[LABEL_NAME_MAX];
+	int loop;
+
+	qualify_label(label_name, full);
+	for(loop = 0; loop < label_count; loop++)
+		if(labels[loop].active && !gstricmp(full, labels[loop].l_name)) return &labels[loop];
+	return NULL;
+}
+
+static int CheckValidLabel(const char *name)
+{
+	int num, size;
+	const char *p;
+
+	if(!is_ident_start((unsigned char)name[0])) return FALSE;
+	for(p = name; *p; p++) if(!is_ident_char((unsigned char)*p)) return FALSE;
+	if(lookup_register(name, &num, &size) != RK_NONE) return FALSE;
+	return TRUE;
+}
+
+static void Addlabel(const char *label_name, i64 value)
+{
+	char full[LABEL_NAME_MAX];
+	t_label *l;
+
+	if(CheckValidLabel(label_name) == FALSE) fatal_error("invalid label name '%s'", label_name);
+	qualify_label(label_name, full);
+	if(label_name[0] != '.') strcpy(last_global, label_name);
+
+	l = Findlabel(full);
+	if(l)
+	{
+		if(l->pass_number == pass_number) fatal_error("duplicate label '%s'", full);
+		if(l->m_offset != value) labels_changed = TRUE;
+		l->m_offset = value;
+		l->pass_number = pass_number;
+		return;
+	}
+	if(label_count >= MAX_LABELS) fatal_error("too many labels");
+	l = &labels[label_count++];
+	strcpy(l->l_name, full);
+	l->m_offset = value;
+	l->active = TRUE;
+	l->pass_number = pass_number;
+	labels_changed = TRUE;
+}
+
+//**************************************
+// Expression evaluator
+// Precedence (lowest first): |  ^  &  << >>  + -  * / // % %%  unary - + ~ !
+//**************************************
+typedef struct
+{
+	const char *p;
+	int unresolved;		// an undefined (forward) label was referenced
+} t_expr;
+
+static i64 expr_or(t_expr *e);
+
+// Two's complement wrapping arithmetic (signed overflow is undefined behaviour in C++)
+typedef unsigned long long u64;
+static i64 wrap_neg(i64 a) { return (i64)(0 - (u64)a); }
+static i64 wrap_add(i64 a, i64 b) { return (i64)((u64)a + (u64)b); }
+static i64 wrap_sub(i64 a, i64 b) { return (i64)((u64)a - (u64)b); }
+static i64 wrap_mul(i64 a, i64 b) { return (i64)((u64)a * (u64)b); }
+
+static void skip_ws(t_expr *e) { while(*e->p == ' ' || *e->p == '\t') e->p++; }
+
+static int digit_value(int c)
+{
+	if(c >= '0' && c <= '9') return c - '0';
+	if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return 99;
+}
+
+static int parse_digits(const char *s, int len, int base, i64 *out)
+{
+	unsigned long long v = 0;
+	int i, any = FALSE;
+
+	for(i = 0; i < len; i++)
+	{
+		int d;
+		if(s[i] == '_') continue;
+		d = digit_value((unsigned char)s[i]);
+		if(d >= base) return FALSE;
+		v = v * base + d;
+		any = TRUE;
+	}
+	*out = (i64)v;
+	return any;
+}
+
+// Numbers: 123, 123d, 0x7F, 7Fh, 0b101, 101b, 17q, 17o
+static i64 parse_number(t_expr *e)
+{
+	char tok[128];
+	int len = 0, ok;
+	char last;
+	i64 v = 0;
+
+	while(isalnum((unsigned char)*e->p) || *e->p == '_')
+	{
+		if(len >= (int)sizeof(tok) - 1) fatal_error("number too long");
+		tok[len++] = *e->p++;
+	}
+	tok[len] = '\0';
+	last = (char)tolower((unsigned char)tok[len-1]);
+
+	if(len > 2 && tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) ok = parse_digits(tok + 2, len - 2, 16, &v);
+	else if(last == 'h') ok = parse_digits(tok, len - 1, 16, &v);
+	else if(len > 2 && tok[0] == '0' && (tok[1] == 'b' || tok[1] == 'B') && parse_digits(tok + 2, len - 2, 2, &v)) ok = TRUE;
+	else if(len > 2 && tok[0] == '0' && (tok[1] == 'o' || tok[1] == 'O' || tok[1] == 'q' || tok[1] == 'Q')) ok = parse_digits(tok + 2, len - 2, 8, &v);
+	else if(last == 'b' || last == 'y') ok = parse_digits(tok, len - 1, 2, &v);
+	else if(last == 'q' || last == 'o') ok = parse_digits(tok, len - 1, 8, &v);
+	else if(last == 'd' || last == 't') ok = parse_digits(tok, len - 1, 10, &v);
+	else ok = parse_digits(tok, len, 10, &v);
+
+	if(!ok) fatal_error("invalid number '%s'", tok);
+	return v;
+}
+
+static i64 expr_primary(t_expr *e)
+{
+	i64 v = 0;
+
+	skip_ws(e);
+	if(*e->p == '(')
+	{
+		e->p++;
+		v = expr_or(e);
+		skip_ws(e);
+		if(*e->p != ')') fatal_error("missing ')' in expression");
+		e->p++;
+		return v;
+	}
+	if(isdigit((unsigned char)*e->p)) return parse_number(e);
+	if(is_quote(*e->p))
+	{
+		// character constant, little endian: 'ab' = 0x6261
+		char q = *e->p++;
+		int shift = 0;
+		while(*e->p && *e->p != q)
+		{
+			if(shift >= 64) fatal_error("character constant too long");
+			v |= (i64)(unsigned char)*e->p++ << shift;
+			shift += 8;
+		}
+		if(*e->p != q) fatal_error("unterminated character constant");
+		e->p++;
+		return v;
+	}
+	if(e->p[0] == '$' && e->p[1] == '$') { e->p += 2; return origin; }
+	if(e->p[0] == '$' && !is_ident_char((unsigned char)e->p[1])) { e->p++; return line_start; }
+	if(is_ident_start((unsigned char)*e->p) || (*e->p == '$' && is_ident_start((unsigned char)e->p[1])))
+	{
+		char name[LABEL_NAME_MAX];
+		int len = 0, num, size;
+		t_label *l;
+
+		if(*e->p == '$') e->p++;	// $name forces an identifier
+		while(is_ident_char((unsigned char)*e->p))
+		{
+			if(len >= LABEL_NAME_MAX - 1) fatal_error("identifier too long");
+			name[len++] = *e->p++;
+		}
+		name[len] = '\0';
+		if(lookup_register(name, &num, &size) != RK_NONE) fatal_error("register '%s' not allowed in expression", name);
+		l = Findlabel(name);
+		if(l) return l->m_offset;
+		// Every label has been seen once pass 1 is complete
+		if(pass_number > 1) fatal_error("undefined label/identifier '%s'", name);
+		e->unresolved = TRUE;
+		return 0;
+	}
+	if(*e->p == '\0') fatal_error("expression expected");
+	fatal_error("unexpected character '%c' in expression", *e->p);
+	return 0;
+}
+
+static i64 expr_unary(t_expr *e)
+{
+	skip_ws(e);
+	if(*e->p == '-') { e->p++; return wrap_neg(expr_unary(e)); }
+	if(*e->p == '+') { e->p++; return expr_unary(e); }
+	if(*e->p == '~') { e->p++; return ~expr_unary(e); }
+	if(*e->p == '!') { e->p++; return !expr_unary(e); }
+	return expr_primary(e);
+}
+
+static i64 expr_mul(t_expr *e)
+{
+	i64 v = expr_unary(e), r;
+
+	for(;;)
+	{
+		skip_ws(e);
+		if(*e->p == '*') { e->p++; v = wrap_mul(v, expr_unary(e)); }
+		else if(*e->p == '/' || *e->p == '%')
+		{
+			char op = *e->p++;
+			int is_signed = (*e->p == op);	// '//' and '%%' are signed
+			if(is_signed) e->p++;
+			r = expr_unary(e);
+			if(r == 0)
+			{
+				if(e->unresolved) { v = 0; continue; }
+				fatal_error("division by zero");
+			}
+			if(is_signed && r == -1) v = (op == '/') ? wrap_neg(v) : 0;	// avoid INT64_MIN / -1
+			else if(is_signed) v = (op == '/') ? v / r : v % r;
+			else v = (op == '/') ? (i64)((unsigned long long)v / (unsigned long long)r) : (i64)((unsigned long long)v % (unsigned long long)r);
+		}
+		else return v;
+	}
+}
+
+static i64 expr_add(t_expr *e)
+{
+	i64 v = expr_mul(e);
+
+	for(;;)
+	{
+		skip_ws(e);
+		if(*e->p == '+') { e->p++; v = wrap_add(v, expr_mul(e)); }
+		else if(*e->p == '-') { e->p++; v = wrap_sub(v, expr_mul(e)); }
+		else return v;
+	}
+}
+
+static i64 expr_shift(t_expr *e)
+{
+	i64 v = expr_add(e), r;
+
+	for(;;)
+	{
+		skip_ws(e);
+		if(e->p[0] == '<' && e->p[1] == '<') { e->p += 2; r = expr_add(e); v = (r >= 64 || r < 0) ? 0 : (i64)((unsigned long long)v << r); }
+		else if(e->p[0] == '>' && e->p[1] == '>') { e->p += 2; r = expr_add(e); v = (r >= 64 || r < 0) ? 0 : (i64)((unsigned long long)v >> r); }
+		else return v;
+	}
+}
+
+static i64 expr_and(t_expr *e)
+{
+	i64 v = expr_shift(e);
+	for(;;) { skip_ws(e); if(*e->p == '&') { e->p++; v &= expr_shift(e); } else return v; }
+}
+
+static i64 expr_xor(t_expr *e)
+{
+	i64 v = expr_and(e);
+	for(;;) { skip_ws(e); if(*e->p == '^') { e->p++; v ^= expr_and(e); } else return v; }
+}
+
+static i64 expr_or(t_expr *e)
+{
+	i64 v = expr_xor(e);
+	for(;;) { skip_ws(e); if(*e->p == '|') { e->p++; v |= expr_xor(e); } else return v; }
+}
+
+// Evaluates the longest expression prefix of s; *end receives the rest.
+static i64 EvaluatePrefix(const char *s, const char **end, int *unresolved)
+{
+	t_expr e;
+	i64 v;
+
+	e.p = s;
+	e.unresolved = FALSE;
+	v = expr_or(&e);
+	skip_ws(&e);
+	*end = e.p;
+	if(unresolved) *unresolved = e.unresolved;
+	return v;
+}
+
+// Evaluates a complete expression. *unresolved (optional) is set if a forward reference was used.
+static i64 Evaluate(const char *s, int *unresolved)
+{
+	const char *end;
+	i64 v = EvaluatePrefix(s, &end, unresolved);
+
+	if(*end != '\0') fatal_error("unexpected '%s' in expression", end);
+	return v;
+}
+
+//**************************************
+// Output
+//**************************************
+// Accounts for n more bytes of output, enforcing the size limit (on every pass).
+static void count_output(i64 n)
+{
+	if(n < 0 || n > MAX_OUTPUT - emitted) fatal_error("output exceeds %lld bytes", MAX_OUTPUT);
+	emitted += n;
+}
+
+static void reserve_output(size_t n)
+{
+	if(outlen + n > outcap)
+	{
+		size_t newcap = outcap ? outcap : 4096;
+		while(newcap < outlen + n) newcap *= 2;
+		outbuf = (unsigned char *)realloc(outbuf, newcap);
+		if(!outbuf) fatal_error("out of memory");
+		outcap = newcap;
+	}
+}
+
+static void emit(const unsigned char *bytes, size_t n)
+{
+	count_output((i64)n);
+	if(final_pass)
+	{
+		reserve_output(n);
+		memcpy(outbuf + outlen, bytes, n);
+		outlen += n;
+	}
+	offset += n;
+}
+
+static void emit_fill(unsigned char value, i64 count)
+{
+	if(count <= 0) return;
+	count_output(count);
+	if(final_pass)
+	{
+		reserve_output((size_t)count);
+		memset(outbuf + outlen, value, (size_t)count);
+		outlen += (size_t)count;
+	}
+	offset += count;
+}
+
+// Appends 'count' more copies of the 'size' bytes that start at output position 'start'.
+static void emit_repeat(size_t start, i64 size, i64 count)
+{
+	i64 i;
+
+	if(size <= 0 || count <= 0) return;
+	if(count > MAX_OUTPUT / size) fatal_error("output exceeds %lld bytes", MAX_OUTPUT);
+	count_output(size * count);
+	if(final_pass)
+	{
+		reserve_output((size_t)(size * count));
+		for(i = 0; i < count; i++)
+		{
+			memcpy(outbuf + outlen, outbuf + start, (size_t)size);
+			outlen += (size_t)size;
+		}
+	}
+	offset += size * count;
+}
+
+//**************************************
+// Operands
+//**************************************
+enum { OP_NONE, OP_REG, OP_SREG, OP_CREG, OP_DREG, OP_MEM, OP_IMM, OP_FAR };
+
+typedef struct
+{
+	int kind;
+	int size;		// register size, or explicit size keyword (0 = unspecified)
+	int reg;		// register number
+	int strict;		// 0, 'S'hort, 'N'ear or 'F'ar
+	// memory operands
+	int base, index, scale;	// base/index are -1 when absent
+	int asize;		// address size: 16 or 32
+	int seg;		// segment override prefix byte, 0 if none
+	// immediate value / memory displacement / far pointer offset
+	i64 value;
+	int unresolved;
+	i64 farseg;		// far pointer segment
+	char text[128];		// original operand text, for error messages
+} t_operand;
+
+// Reads a small integer constant (a scale factor) from s[0..len).
+static int scale_value(const char *s, int len, const t_operand *op)
+{
+	char tmp[32];
+
+	if(len <= 0 || len >= (int)sizeof(tmp)) fatal_error("invalid effective address '%s'", op->text);
+	memcpy(tmp, s, len);
+	tmp[len] = '\0';
+	return (int)Evaluate(tmp, NULL);
+}
+
+// Parses the inside of [ ] into base/index/scale/displacement.
+// Register terms must be added (reg, reg*n or n*reg); everything else is the displacement.
+static void ParseMemory(char *inner, t_operand *op)
+{
+	char expr[MAX_LINE];
+	int regs[2], scales[2], sizes[2], nregs = 0, num, size, i;
+	char *p, *q = expr;
+	char *colon;
+
+	op->kind = OP_MEM;
+	op->base = op->index = -1;
+	op->scale = 1;
+
+	// [seg:...] override
+	inner = trim(inner);
+	colon = strchr(inner, ':');
+	if(colon)
+	{
+		char segname[8];
+		int n = (int)(colon - inner);
+		if(n > 4) fatal_error("invalid segment override in '%s'", op->text);
+		memcpy(segname, inner, n);
+		segname[n] = '\0';
+		if(lookup_register(trim(segname), &num, &size) != RK_SREG) fatal_error("invalid segment override in '%s'", op->text);
+		if(op->seg) fatal_error("multiple segment overrides");
+		op->seg = sreg_prefix[num];
+		inner = trim(colon + 1);
+	}
+	p = inner;
+
+	// Copy the expression, replacing register terms with 0
+	while(*p)
+	{
+		if(is_ident_start((unsigned char)*p) && (p == inner || !is_ident_char((unsigned char)p[-1])))
+		{
+			char name[LABEL_NAME_MAX];
+			int len = 0, scale = 1;
+			char *s = p, *b, *after;
+
+			while(is_ident_char((unsigned char)*p) && len < LABEL_NAME_MAX - 1) name[len++] = *p++;
+			name[len] = '\0';
+			if(lookup_register(name, &num, &size) != RK_GP)
+			{
+				memcpy(q, s, p - s);	// not a register: copy the identifier
+				q += p - s;
+				continue;
+			}
+			if(size == 8) fatal_error("8-bit register not allowed in memory operand");
+			if(nregs >= 2) fatal_error("too many registers in memory operand");
+
+			// what precedes the register?
+			b = s;
+			while(b > inner && (b[-1] == ' ' || b[-1] == '\t')) b--;
+			if(b > inner && b[-1] == '*')
+			{
+				// n*reg
+				char *n_end = b - 1, *n_start;
+				while(n_end > inner && (n_end[-1] == ' ' || n_end[-1] == '\t')) n_end--;
+				n_start = n_end;
+				while(n_start > inner && isalnum((unsigned char)n_start[-1])) n_start--;
+				scale = scale_value(n_start, (int)(n_end - n_start), op);
+				b = n_start;
+				while(b > inner && (b[-1] == ' ' || b[-1] == '\t')) b--;
+				q -= (s - n_start);	// drop "n*" from the copied expression
+				if(q < expr) fatal_error("invalid effective address '%s'", op->text);
+			}
+			if(b != inner && b[-1] != '+') fatal_error("invalid effective address '%s'", op->text);
+
+			// reg*n
+			after = p;
+			while(*after == ' ' || *after == '\t') after++;
+			if(*after == '*')
+			{
+				char *n = after + 1, *ne;
+				if(scale != 1) fatal_error("invalid effective address '%s'", op->text);
+				while(*n == ' ' || *n == '\t') n++;
+				ne = n;
+				while(isalnum((unsigned char)*ne)) ne++;
+				scale = scale_value(n, (int)(ne - n), op);
+				p = after = ne;
+				while(*after == ' ' || *after == '\t') after++;
+			}
+			if(*after != '\0' && *after != '+' && *after != '-') fatal_error("invalid effective address '%s'", op->text);
+			if(scale != 1 && scale != 2 && scale != 4 && scale != 8) fatal_error("invalid scale factor %d", scale);
+
+			regs[nregs] = num;
+			scales[nregs] = scale;
+			sizes[nregs] = size;
+			nregs++;
+			*q++ = '0';
+			continue;
+		}
+		*q++ = *p++;
+	}
+	*q = '\0';
+
+	if(*trim(expr) == '\0') fatal_error("empty memory operand");
+	op->value = Evaluate(trim(expr), &op->unresolved);
+
+	if(nregs == 2 && sizes[0] != sizes[1]) fatal_error("cannot mix 16 and 32-bit registers in memory operand");
+	if(nregs > 0) op->asize = sizes[0];
+	else
+	{
+		// absolute address: default address size, unless it cannot fit in 16 bits
+		op->asize = BITS;
+		if(BITS == 16 && !op->unresolved && (op->value > 0xFFFF || op->value < -0x8000)) op->asize = 32;
+	}
+
+	if(op->asize == 16)
+	{
+		int has_b = -1, has_i = -1;
+		for(i = 0; i < nregs; i++)
+		{
+			if(scales[i] != 1) fatal_error("scaled index not allowed with 16-bit addressing");
+			if(regs[i] == 3 || regs[i] == 5) { if(has_b != -1) fatal_error("invalid 16-bit effective address '%s'", op->text); has_b = regs[i]; }
+			else if(regs[i] == 6 || regs[i] == 7) { if(has_i != -1) fatal_error("invalid 16-bit effective address '%s'", op->text); has_i = regs[i]; }
+			else fatal_error("invalid 16-bit effective address '%s'", op->text);
+		}
+		op->base = has_b;
+		op->index = has_i;
+	}
+	else
+	{
+		if(nregs == 1)
+		{
+			if(scales[0] == 1) op->base = regs[0];
+			else if(scales[0] == 2 && regs[0] != 4) { op->base = op->index = regs[0]; }	// [r*2] -> [r+r] (no disp32 needed)
+			else { op->index = regs[0]; op->scale = scales[0]; }
+		}
+		else if(nregs == 2)
+		{
+			// the scaled register is the index; esp can only be a base
+			int bi = 0, ii = 1;
+			if(scales[0] != 1 && scales[1] != 1) fatal_error("only one register may be scaled");
+			if(scales[0] != 1) { bi = 1; ii = 0; }
+			else if(scales[1] == 1 && regs[1] == 4) { bi = 1; ii = 0; }
+			op->base = regs[bi];
+			op->index = regs[ii];
+			op->scale = scales[ii];
+		}
+		if(op->index == 4) fatal_error("esp cannot be used as an index register");
+	}
+}
+
+static void ParseOperand(char *text, t_operand *op)
+{
+	char *p, *k;
+	int num, size, kind;
+
+	memset(op, 0, sizeof(*op));
+	op->base = op->index = -1;
+	op->scale = 1;
+	snprintf(op->text, sizeof(op->text), "%s", trim(text));
+	p = trim(text);
+
+	// size / distance keywords
+	for(;;)
+	{
+		if((k = match_keyword(p, "byte"))) { op->size = 8; p = trim(k); }
+		else if((k = match_keyword(p, "word"))) { op->size = 16; p = trim(k); }
+		else if((k = match_keyword(p, "dword"))) { op->size = 32; p = trim(k); }
+		else if((k = match_keyword(p, "short"))) { op->strict = 'S'; p = trim(k); }
+		else if((k = match_keyword(p, "near"))) { op->strict = 'N'; p = trim(k); }
+		else if((k = match_keyword(p, "far"))) { op->strict = 'F'; p = trim(k); }
+		else break;
+	}
+	if(*p == '\0') fatal_error("operand expected");
+
+	// gasm style seg:[...] override
+	if(strlen(p) > 3 && p[2] == ':')
+	{
+		char segname[3] = { p[0], p[1], '\0' };
+		if(lookup_register(segname, &num, &size) == RK_SREG)
+		{
+			char *r = trim(p + 3);
+			if(*r != '[') fatal_error("segment override must be followed by a memory operand");
+			op->seg = sreg_prefix[num];
+			p = r;
+		}
+	}
+
+	if(*p == '[')
+	{
+		size_t n = strlen(p);
+		if(p[n-1] != ']') fatal_error("missing ']' in '%s'", text);
+		p[n-1] = '\0';
+		ParseMemory(p + 1, op);
+		return;
+	}
+
+	kind = lookup_register(p, &num, &size);
+	if(kind != RK_NONE)
+	{
+		if(op->size && op->size != size) fatal_error("register size does not match size keyword");
+		op->reg = num;
+		op->size = size;
+		op->kind = (kind == RK_GP) ? OP_REG : (kind == RK_SREG) ? OP_SREG : (kind == RK_CREG) ? OP_CREG : OP_DREG;
+		return;
+	}
+
+	// seg:offset far pointer (top level colon outside quotes)
+	{
+		char quote = 0, *c, *colon = NULL;
+		for(c = p; *c; c++)
+		{
+			if(quote) { if(*c == quote) quote = 0; continue; }
+			if(is_quote(*c)) quote = *c;
+			else if(*c == ':') { colon = c; break; }
+		}
+		if(colon)
+		{
+			int u1 = 0, u2 = 0;
+			*colon = '\0';
+			op->kind = OP_FAR;
+			op->farseg = Evaluate(p, &u1);
+			op->value = Evaluate(colon + 1, &u2);
+			op->unresolved = u1 || u2;
+			return;
+		}
+	}
+
+	op->kind = OP_IMM;
+	op->value = Evaluate(p, &op->unresolved);
+}
+
+//**************************************
+// Instruction encoding
+//**************************************
+typedef struct
+{
+	unsigned char b[32];
+	int len;
+	int imm_bytes;		// bytes of immediate data (used to prefer sign-extended forms)
+} t_code;
+
+static void put(t_code *c, i64 v, int n)
+{
+	int i;
+	for(i = 0; i < n; i++) c->b[c->len++] = (unsigned char)(v >> (8 * i));
+}
+
+static int fits_s8(i64 v) { return v >= -128 && v <= 127; }
+
+// Encodes ModRM (+SIB +displacement) for operand op with the given reg field.
+static void encode_modrm(t_code *c, const t_operand *op, int regfield)
+{
+	if(op->kind == OP_REG)
+	{
+		c->b[c->len++] = (unsigned char)(0xC0 | (regfield << 3) | op->reg);
+		return;
+	}
+
+	if(op->asize == 16)
+	{
+		int rm, mod, dsize;
+		int b = op->base, i = op->index;
+
+		if(!op->unresolved && (op->value > 0xFFFF || op->value < -0x8000)) fatal_error("displacement out of range for 16-bit addressing");
+		if(b == -1 && i == -1)
+		{
+			c->b[c->len++] = (unsigned char)((regfield << 3) | 6);
+			put(c, op->value, 2);
+			return;
+		}
+		if(b == 3 && i == 6) rm = 0;		// [bx+si]
+		else if(b == 3 && i == 7) rm = 1;	// [bx+di]
+		else if(b == 5 && i == 6) rm = 2;	// [bp+si]
+		else if(b == 5 && i == 7) rm = 3;	// [bp+di]
+		else if(b == -1 && i == 6) rm = 4;	// [si]
+		else if(b == -1 && i == 7) rm = 5;	// [di]
+		else if(b == 5 && i == -1) rm = 6;	// [bp] (needs a displacement)
+		else rm = 7;				// [bx]
+
+		if(!op->unresolved && op->value == 0 && rm != 6) { mod = 0; dsize = 0; }
+		else if(!op->unresolved && fits_s8(op->value)) { mod = 1; dsize = 1; }
+		else { mod = 2; dsize = 2; }
+		c->b[c->len++] = (unsigned char)((mod << 6) | (regfield << 3) | rm);
+		put(c, op->value, dsize);
+		return;
+	}
+
+	// 32-bit addressing
+	{
+		int b = op->base, i = op->index, mod, dsize, ss;
+
+		if(!op->unresolved && (op->value > 0xFFFFFFFFLL || op->value < -0x80000000LL)) fatal_error("displacement out of range");
+		if(b == -1 && i == -1)
+		{
+			c->b[c->len++] = (unsigned char)((regfield << 3) | 5);
+			put(c, op->value, 4);
+			return;
+		}
+		ss = (op->scale == 8) ? 3 : (op->scale == 4) ? 2 : (op->scale == 2) ? 1 : 0;
+		if(b == -1)
+		{
+			// index only: SIB with no base, always disp32
+			c->b[c->len++] = (unsigned char)((regfield << 3) | 4);
+			c->b[c->len++] = (unsigned char)((ss << 6) | (i << 3) | 5);
+			put(c, op->value, 4);
+			return;
+		}
+		if(!op->unresolved && op->value == 0 && b != 5) { mod = 0; dsize = 0; }	// [ebp] needs a displacement
+		else if(!op->unresolved && fits_s8(op->value)) { mod = 1; dsize = 1; }
+		else { mod = 2; dsize = 4; }
+
+		if(i == -1 && b != 4)
+			c->b[c->len++] = (unsigned char)((mod << 6) | (regfield << 3) | b);
+		else
+		{
+			// SIB needed for an index, or for esp as base
+			c->b[c->len++] = (unsigned char)((mod << 6) | (regfield << 3) | 4);
+			c->b[c->len++] = (unsigned char)((ss << 6) | ((i == -1 ? 4 : i) << 3) | b);
+		}
+		put(c, op->value, dsize);
+	}
+}
+
+static int param_is_imm(unsigned int t) { return t == EVALUATE_IMM8 || t == EVALUATE_IMM16 || t == EVALUATE_IMM32; }
+static int param_is_regm(unsigned int t) { return t == EVALUATE_REGM8 || t == EVALUATE_REGM16 || t == EVALUATE_REGM32; }
+static int param_is_reg(unsigned int t) { return t == EVALUATE_REG8 || t == EVALUATE_REG16 || t == EVALUATE_REG32; }
+
+static int param_size(unsigned int t)
+{
+	switch(t)
+	{
+		case EVALUATE_REG8: case EVALUATE_REGM8: case EVALUATE_IMM8: case EVALUATE_AL: case EVALUATE_CL: return 8;
+		case EVALUATE_REG16: case EVALUATE_REGM16: case EVALUATE_IMM16: case EVALUATE_AX: case EVALUATE_DX: return 16;
+		case EVALUATE_REG32: case EVALUATE_REGM32: case EVALUATE_IMM32: case EVALUATE_EAX: return 32;
+	}
+	return 0;
+}
+
+static int in_list(const char *m, const char *const *list)
+{
+	for(; *list; list++) if(!gstricmp(m, *list)) return TRUE;
+	return FALSE;
+}
+
+static const char *const no_opsize_list[] = { "lldt", "ltr", "verr", "verw", "lmsw", "arpl", NULL };
+static const char *const imm16_fixed_list[] = { "ret", "retf", "enter", NULL };
+static const char *const mem16_only_list[] = { "sldt", "smsw", "str", NULL };	// memory form is always 16-bit
+
+// Operand size implied by a dynamic table entry: 0 (none), 16 or 32.
+static int entry_opsize(const t_dynamic_instruction *d)
+{
+	unsigned int p[2];
+	int i, size = 0;
+
+	p[0] = d->parm1; p[1] = d->parm2;
+	if(d->format & FORMAT_REL32) return 32;
+	if(d->format & FORMAT_REL16) return 16;
+	for(i = 0; i < 2; i++)
+		if(p[i] == EVALUATE_SREG || p[i] == EVALUATE_CREG || p[i] == EVALUATE_DREG) return 0;
+	if(in_list(d->instruction, no_opsize_list)) return 0;
+	for(i = 0; i < 2; i++)
+	{
+		switch(p[i])
+		{
+			case EVALUATE_REG32: case EVALUATE_REGM32: case EVALUATE_EAX: case EVALUATE_PTR16_PTR32: case EVALUATE_IMM32:
+				return 32;
+			case EVALUATE_REG16: case EVALUATE_REGM16: case EVALUATE_AX: case EVALUATE_PTR16_PTR16:
+				size = 16;
+				break;
+			case EVALUATE_IMM16:
+				if(!in_list(d->instruction, imm16_fixed_list)) size = 16;
+				break;
+		}
+	}
+	return size;
+}
+
+// Is this IMM8 slot sign-extended to the operand size?
+static int imm8_sign_extended(const t_dynamic_instruction *d)
+{
+	return d->opcode_length == 1 && (d->c1 == 0x83 || d->c1 == 0x6A || d->c1 == 0x6B);
+}
+
+// Does operand op fit parameter type t of entry d? *uncertain is set when it only fits
+// because the value is not known yet.
+static int match_param(const t_dynamic_instruction *d, unsigned int t, const t_operand *op, int *uncertain)
+{
+	int opsize = entry_opsize(d);
+	int eff = opsize ? opsize : BITS;
+
+	switch(t)
+	{
+		case EVALUATE_NONE: return op->kind == OP_NONE;
+		case EVALUATE_REG8: case EVALUATE_REG16: case EVALUATE_REG32:
+			return op->kind == OP_REG && op->size == param_size(t);
+		case EVALUATE_AL: return op->kind == OP_REG && op->size == 8 && op->reg == 0;
+		case EVALUATE_CL: return op->kind == OP_REG && op->size == 8 && op->reg == 1;
+		case EVALUATE_AX: return op->kind == OP_REG && op->size == 16 && op->reg == 0;
+		case EVALUATE_EAX: return op->kind == OP_REG && op->size == 32 && op->reg == 0;
+		case EVALUATE_DX: return op->kind == OP_REG && op->size == 16 && op->reg == 2;
+		case EVALUATE_SREG: return op->kind == OP_SREG;
+		case EVALUATE_CREG: return op->kind == OP_CREG;
+		case EVALUATE_DREG: return op->kind == OP_DREG;
+		case EVALUATE_REGM8: case EVALUATE_REGM16: case EVALUATE_REGM32:
+			if(op->kind == OP_REG) return op->size == param_size(t);
+			if(op->kind == OP_MEM) return op->size == 0 || op->size == param_size(t);
+			return FALSE;
+		case EVALUATE_PTR16_PTR16: case EVALUATE_PTR16_PTR32:
+			if(op->kind != OP_FAR) return FALSE;
+			if(op->size && op->size != (t == EVALUATE_PTR16_PTR32 ? 32 : 16)) return FALSE;
+			if(t == EVALUATE_PTR16_PTR16 && !op->unresolved && (op->value > 0xFFFF || op->value < 0)) return FALSE;
+			return TRUE;
+		case EVALUATE_IMM8: case EVALUATE_IMM16: case EVALUATE_IMM32:
+		{
+			i64 v = op->value;
+			if(op->kind != OP_IMM) return FALSE;
+			if(d->format & (FORMAT_REL8 | FORMAT_REL16 | FORMAT_REL32))
+			{
+				if(op->size && op->size != eff) return FALSE;
+				if(op->strict == 'S' && !(d->format & FORMAT_REL8)) return FALSE;
+				if(op->strict == 'N' && (d->format & FORMAT_REL8)) return FALSE;
+				return TRUE;	// range is checked once the instruction length is known
+			}
+			if(op->strict) return FALSE;
+			if(op->size)
+			{
+				if(op->size == 8 && t != EVALUATE_IMM8) return FALSE;
+				if(op->size != 8 && eff != op->size) return FALSE;
+			}
+			if(t == EVALUATE_IMM8)
+			{
+				if(imm8_sign_extended(d))
+				{
+					i64 m = (eff == 32) ? 0xFFFFFFFFLL : 0xFFFF;
+					if(op->unresolved) { *uncertain = TRUE; return TRUE; }
+					if(v < -(m / 2 + 1) || v > m) return FALSE;
+					return (v & m) == ((i64)(signed char)(v & 0xFF) & m);
+				}
+				if(op->unresolved) return TRUE;
+				return v >= -128 && v <= 255;
+			}
+			if(op->unresolved) return TRUE;
+			if(t == EVALUATE_IMM16) return v >= -32768 && v <= 65535;
+			return v >= -2147483648LL && v <= 4294967295LL;
+		}
+	}
+	return FALSE;
+}
+
+// Encodes entry d with operands o[0], o[1] located at address 'here'.
+// Returns FALSE if a relative branch target is out of range for this form.
+static int encode_entry(const t_dynamic_instruction *d, const t_operand *o, i64 here, t_code *c)
+{
+	unsigned int p[2];
+	int opsize = entry_opsize(d);
+	int i, rel_pos = -1, rel_size = 0, mem = -1;
+	int short_shift = FALSE;
+	unsigned char op1 = d->c1;
+
+	p[0] = d->parm1; p[1] = d->parm2;
+	c->len = 0;
+	c->imm_bytes = 0;
+
+	for(i = 0; i < 2; i++) if(o[i].kind == OP_MEM) mem = i;
+	if(mem >= 0 && in_list(d->instruction, mem16_only_list)) opsize = 0;
+
+	// prefixes
+	if(mem >= 0 && o[mem].seg) c->b[c->len++] = (unsigned char)o[mem].seg;
+	if(opsize && opsize != BITS) c->b[c->len++] = 0x66;
+	else if(p[1] == EVALUATE_SREG && o[0].kind == OP_REG && o[0].size != BITS) c->b[c->len++] = 0x66;	// mov r16, sreg
+	if(mem >= 0 && o[mem].asize != BITS) c->b[c->len++] = 0x67;
+	if(!gstricmp(d->instruction, "jcxz") && BITS != 16) c->b[c->len++] = 0x67;
+	if(!gstricmp(d->instruction, "jecxz") && BITS != 32) c->b[c->len++] = 0x67;
+
+	// shift/rotate by an immediate 1 uses the shorter (and 8086 compatible) D0/D1 form
+	if((d->c1 == 0xC0 || d->c1 == 0xC1) && d->opcode_length == 1 && o[1].kind == OP_IMM && !o[1].unresolved && o[1].value == 1)
+	{
+		short_shift = TRUE;
+		op1 = (d->c1 == 0xC0) ? 0xD0 : 0xD1;
+	}
+
+	// opcode
+	c->b[c->len++] = op1;
+	if(d->opcode_length >= 2) c->b[c->len++] = d->c2;
+	if(d->opcode_length >= 3) c->b[c->len++] = d->c3;
+
+	if(d->format & FORMAT_REGPLUSOP)
+		for(i = 0; i < 2; i++) if(param_is_reg(p[i])) c->b[c->len-1] += o[i].reg;
+
+	if(d->format & FORMAT_MODRM)
+	{
+		int regfield = d->initial_modrm >> 3, rm = -1;
+		for(i = 0; i < 2; i++)
+		{
+			if(param_is_reg(p[i]) || p[i] == EVALUATE_SREG || p[i] == EVALUATE_CREG || p[i] == EVALUATE_DREG) regfield = o[i].reg;
+			else if(param_is_regm(p[i])) rm = i;
+		}
+		if(rm < 0) fatal_error("internal error: no r/m operand for '%s'", d->instruction);
+		encode_modrm(c, &o[rm], regfield);
+	}
+
+	// immediates / relative targets / far pointers
+	for(i = 0; i < 2; i++)
+	{
+		if(param_is_imm(p[i]))
+		{
+			int n = param_size(p[i]) / 8;
+			if(d->format & (FORMAT_REL8 | FORMAT_REL16 | FORMAT_REL32))
+			{
+				rel_pos = c->len;
+				rel_size = n;
+				c->len += n;
+				continue;
+			}
+			if(short_shift && i == 1) continue;
+			put(c, o[i].value, n);
+			c->imm_bytes += n;
+		}
+		else if(p[i] == EVALUATE_PTR16_PTR16 || p[i] == EVALUATE_PTR16_PTR32)
+		{
+			put(c, o[i].value, p[i] == EVALUATE_PTR16_PTR32 ? 4 : 2);
+			put(c, o[i].farseg, 2);
+		}
+	}
+
+	if(rel_pos >= 0)
+	{
+		// relative to the end of the instruction
+		i64 rel = wrap_sub(o[0].value, here + c->len);
+		int save = c->len;
+		// Forward references (first pass only) optimistically assume a short branch fits;
+		// later passes grow it if needed, converging on the shortest encoding.
+		if(o[0].unresolved) {}
+		else if(rel_size == 1 && !fits_s8(rel)) return FALSE;
+		else if(rel_size == 2 && (rel < -65536 || rel > 65535)) return FALSE;
+		c->len = rel_pos;
+		put(c, rel, rel_size);
+		c->len = save;
+	}
+	return TRUE;
+}
+
+static int dynamic_mnemonic(const char *m)
+{
+	int i;
+	for(i = 0; dynamic_lookup[i].opcode_length; i++) if(!gstricmp(m, dynamic_lookup[i].instruction)) return TRUE;
+	return FALSE;
+}
+
+static const t_fixed_instruction *fixed_lookup(const char *m)
+{
+	int i;
+	for(i = 0; fixed_instruction_lookup[i].length; i++) if(!gstricmp(m, fixed_instruction_lookup[i].i_name)) return &fixed_instruction_lookup[i];
+	return NULL;
+}
+
+static int is_instruction(const char *m)
+{
+	return fixed_lookup(m) != NULL || dynamic_mnemonic(m);
+}
+
+// push/pop of segment registers
+static void encode_seg_pushpop(const char *m, const t_operand *o, t_code *c)
+{
+	static const unsigned char push_op[] = { 0x06, 0x0E, 0x16, 0x1E };
+	static const unsigned char pop_op[]  = { 0x07, 0x00, 0x17, 0x1F };
+	int is_push = !gstricmp(m, "push");
+
+	c->len = 0;
+	if(o->reg < 4)
+	{
+		if(!is_push && o->reg == 1) fatal_error("pop cs is not a valid instruction");
+		c->b[c->len++] = is_push ? push_op[o->reg] : pop_op[o->reg];
+	}
+	else
+	{
+		c->b[c->len++] = 0x0F;
+		c->b[c->len++] = (unsigned char)((o->reg == 4 ? 0xA0 : 0xA8) + (is_push ? 0 : 1));
+	}
+}
+
+// imul with an immediate: imul r, r/m, imm  and  imul r, imm
+static void encode_imul_imm(const t_operand *dst, const t_operand *src, const t_operand *imm, t_code *c)
+{
+	int size = dst->size;
+	int use8;
+
+	if(dst->kind != OP_REG || (size != 16 && size != 32)) fatal_error("invalid combination of opcode and operands");
+	if(src->kind != OP_REG && src->kind != OP_MEM) fatal_error("invalid combination of opcode and operands");
+	if((src->kind == OP_REG || src->size) && src->size != size) fatal_error("operand size mismatch");
+	if(imm->kind != OP_IMM || imm->strict) fatal_error("invalid combination of opcode and operands");
+	if(imm->size && imm->size != 8 && imm->size != size) fatal_error("operand size mismatch");
+	if(!imm->unresolved && (imm->value < (size == 16 ? -32768 : -2147483648LL) || imm->value > (size == 16 ? 0xFFFF : 0xFFFFFFFFLL)))
+		fatal_error("immediate value out of range");
+
+	if(imm->size == 8) use8 = TRUE;
+	else if(imm->unresolved || imm->size) use8 = FALSE;
+	else
+	{
+		i64 m = (size == 32) ? 0xFFFFFFFFLL : 0xFFFF;
+		use8 = (imm->value & m) == ((i64)(signed char)(imm->value & 0xFF) & m);
+	}
+	c->len = 0;
+	if(src->kind == OP_MEM && src->seg) c->b[c->len++] = (unsigned char)src->seg;
+	if(size != BITS) c->b[c->len++] = 0x66;
+	if(src->kind == OP_MEM && src->asize != BITS) c->b[c->len++] = 0x67;
+	c->b[c->len++] = use8 ? 0x6B : 0x69;
+	encode_modrm(c, src, dst->reg);
+	put(c, imm->value, use8 ? 1 : size / 8);
+}
+
+// Selects the best table entry for the operands and encodes it.
+// Preference: no unneeded operand size prefix, unsized memory at the default size,
+// shortest encoding, fewest immediate bytes, table order.
+static int select_encoding(const char *mnemonic, const t_operand *o, i64 here, t_code *out)
+{
+	int attempt, k, found = FALSE;
+	int best_pen = 0, best_sz = 0, best_len = 0, best_imm = 0;
+	t_code code;
+
+	// First try without relying on unresolved (forward referenced) values fitting a
+	// short form; only if nothing else matches accept such a form.
+	for(attempt = 0; attempt < 2 && !found; attempt++)
+	{
+		for(k = 0; dynamic_lookup[k].opcode_length; k++)
+		{
+			const t_dynamic_instruction *d = &dynamic_lookup[k];
+			int unc = FALSE, pen, sz_pen = 0, j, swap;
+			t_operand ops[2];
+
+			if(gstricmp(mnemonic, d->instruction)) continue;
+
+			for(swap = 0; swap < 2; swap++)
+			{
+				// test is commutative: also accept "test reg, r/m"
+				if(swap && gstricmp(mnemonic, "test")) break;
+				ops[0] = o[swap]; ops[1] = o[1 - swap];
+				unc = FALSE;
+				if(match_param(d, d->parm1, &ops[0], &unc) && match_param(d, d->parm2, &ops[1], &unc)) break;
+			}
+			if(swap == 2 || (swap == 1 && gstricmp(mnemonic, "test"))) continue;
+			if(attempt == 0 && unc) continue;
+
+			if(!encode_entry(d, ops, here, &code)) continue;
+
+			for(j = 0; j < 2; j++)
+				if(ops[j].kind == OP_MEM && ops[j].size == 0 && param_size(j == 0 ? d->parm1 : d->parm2) != BITS) sz_pen = 1;
+
+			pen = (entry_opsize(d) && entry_opsize(d) != BITS) ? 1 : 0;
+			if(!found || pen < best_pen || (pen == best_pen && (sz_pen < best_sz || (sz_pen == best_sz &&
+				(code.len < best_len || (code.len == best_len && code.imm_bytes < best_imm))))))
+			{
+				found = TRUE;
+				best_pen = pen;
+				best_sz = sz_pen;
+				best_len = code.len;
+				best_imm = code.imm_bytes;
+				*out = code;
+			}
+		}
+	}
+	return found;
+}
+
+// Assembles an instruction (mnemonic + operand text) located at address 'here'.
+static void AssembleInstruction(const char *mnemonic, char *rest, i64 here, t_code *out)
+{
+	char *parts[MAX_OPERANDS];
+	t_operand o[MAX_OPERANDS];
+	int nops, i, k;
+
+	nops = split_commas(rest, parts, MAX_OPERANDS);
+	for(i = 0; i < MAX_OPERANDS; i++) { memset(&o[i], 0, sizeof(o[i])); o[i].kind = OP_NONE; }
+	for(i = 0; i < nops; i++) ParseOperand(parts[i], &o[i]);
+
+	if(nops == 0)
+	{
+		const t_fixed_instruction *f = fixed_lookup(mnemonic);
+		if(!f) fatal_error("'%s' requires operands", mnemonic);
+		out->len = 0;
+		if(f->bits && f->bits != BITS) out->b[out->len++] = 0x66;
+		out->b[out->len++] = f->c1;
+		if(f->length >= 2) out->b[out->len++] = f->c2;
+		if(f->length >= 3) out->b[out->len++] = f->c3;
+		return;
+	}
+
+	if(!gstricmp(mnemonic, "imul") && (nops == 3 || (nops == 2 && o[1].kind == OP_IMM)))
+	{
+		if(nops == 3) encode_imul_imm(&o[0], &o[1], &o[2], out);
+		else encode_imul_imm(&o[0], &o[0], &o[1], out);
+		return;
+	}
+	if(nops > 2) fatal_error("too many operands for '%s'", mnemonic);
+
+	if((!gstricmp(mnemonic, "push") || !gstricmp(mnemonic, "pop")) && nops == 1 && o[0].kind == OP_SREG)
+	{
+		encode_seg_pushpop(mnemonic, &o[0], out);
+		return;
+	}
+
+	// indirect far jmp/call: FF /5, FF /3
+	if((!gstricmp(mnemonic, "jmp") || !gstricmp(mnemonic, "call")) && nops == 1 && o[0].strict == 'F' && o[0].kind == OP_MEM)
+	{
+		out->len = 0;
+		if(o[0].seg) out->b[out->len++] = (unsigned char)o[0].seg;
+		if(o[0].size && o[0].size != 16 && o[0].size != 32) fatal_error("invalid size for far pointer");
+		if(o[0].size && o[0].size != BITS) out->b[out->len++] = 0x66;
+		if(o[0].asize != BITS) out->b[out->len++] = 0x67;
+		out->b[out->len++] = 0xFF;
+		encode_modrm(out, &o[0], !gstricmp(mnemonic, "jmp") ? 5 : 3);
+		return;
+	}
+	for(i = 0; i < nops; i++)
+		if(o[i].strict == 'F' && o[i].kind != OP_FAR) fatal_error("invalid use of 'far'");
+
+	// mov between the accumulator and an absolute address: short A0-A3 (moffs) forms
+	if(!gstricmp(mnemonic, "mov") && nops == 2)
+		for(i = 0; i < 2; i++)
+		{
+			const t_operand *acc = &o[i], *mem = &o[1 - i];
+			if(acc->kind == OP_REG && acc->reg == 0 && mem->kind == OP_MEM && mem->base == -1 && mem->index == -1 && (mem->size == 0 || mem->size == acc->size))
+			{
+				out->len = 0;
+				if(mem->seg) out->b[out->len++] = (unsigned char)mem->seg;
+				if(acc->size != 8 && acc->size != BITS) out->b[out->len++] = 0x66;
+				if(mem->asize != BITS) out->b[out->len++] = 0x67;
+				out->b[out->len++] = (unsigned char)((i == 0 ? 0xA0 : 0xA2) + (acc->size != 8));
+				put(out, mem->value, mem->asize / 8);
+				return;
+			}
+		}
+
+	if(select_encoding(mnemonic, o, here, out)) return;
+
+	// Work out a helpful error message
+	if(o[0].kind == OP_IMM && !o[0].unresolved)
+		for(k = 0; dynamic_lookup[k].opcode_length; k++)
+			if(!gstricmp(mnemonic, dynamic_lookup[k].instruction) && (dynamic_lookup[k].format & (FORMAT_REL8 | FORMAT_REL16 | FORMAT_REL32)))
+				fatal_error(o[0].strict == 'S' ? "short jump out of range" : "jump target out of range");
+	for(i = 0; i < 2; i++)
+		if(o[i].kind == OP_IMM && !o[i].unresolved)
+		{
+			t_operand probe[2];
+			probe[0] = o[0]; probe[1] = o[1];
+			probe[i].unresolved = TRUE;	// would any value fit?
+			if(select_encoding(mnemonic, probe, here, out)) fatal_error("immediate value out of range");
+		}
+	fatal_error("invalid combination of opcode and operands");
+}
+
+//**************************************
+// Directives
+//**************************************
+
+// Is a (trimmed) data item a single complete string literal?
+static int is_string_literal(const char *a)
+{
+	size_t len = strlen(a);
+	return len >= 2 && is_quote(a[0]) && strchr(a + 1, a[0]) == a + len - 1;
+}
+
+static void DataDirective(int unit, char *args)
+{
+	char *parts[MAX_LINE / 2];
+	int n, i, k;
+
+	n = split_commas(args, parts, MAX_LINE / 2);
+	if(n == 0) fatal_error("data expected");
+	for(i = 0; i < n; i++)
+	{
+		char *a = parts[i];
+		size_t len = strlen(a);
+		if(is_string_literal(a) && (unit == 1 || len - 2 > (size_t)unit))
+		{
+			// string: emitted byte by byte, zero padded to a multiple of the unit size
+			size_t slen = len - 2;
+			emit((unsigned char *)a + 1, slen);
+			if(slen % unit) emit_fill(0, unit - slen % unit);
+		}
+		else
+		{
+			unsigned char b[4];
+			i64 v = Evaluate(a, NULL);
+			for(k = 0; k < unit; k++) b[k] = (unsigned char)(v >> (8 * k));
+			emit(b, unit);
+		}
+	}
+}
+
+static void ReserveDirective(int unit, char *args)
+{
+	int unres = 0;
+	i64 n = Evaluate(args, &unres);
+
+	if(n < 0 && !unres) fatal_error("negative reserve count");
+	if(n < 0) n = 0;
+	if(n > MAX_OUTPUT) fatal_error("output exceeds %lld bytes", MAX_OUTPUT);
+	emit_fill(0, n * unit);
+}
+
+// desc base, limit, flags  -- builds an 8 byte segment or gate descriptor
+static void DescDirective(char *args)
+{
+	char *parts[3];
+	i64 base, limit, flags;
+	unsigned char d[8];
+
+	if(split_commas(args, parts, 3) != 3) fatal_error("desc requires 3 operands: base, limit, flags");
+	base = Evaluate(parts[0], NULL);
+	limit = Evaluate(parts[1], NULL);
+	flags = Evaluate(parts[2], NULL);
+
+	if(flags & ((~flags) >> 2) & 0x400)
+	{
+		// gate: offset 0..15, selector, flags + present, offset 16..31
+		i64 f = flags + 0x8000;
+		d[0] = (unsigned char)base; d[1] = (unsigned char)(base >> 8);
+		d[2] = (unsigned char)limit; d[3] = (unsigned char)(limit >> 8);
+		d[4] = (unsigned char)f; d[5] = (unsigned char)(f >> 8);
+		d[6] = (unsigned char)(base >> 16); d[7] = (unsigned char)(base >> 24);
+	}
+	else
+	{
+		// segment: limit 0..15, base 0..23, access, flags + limit 16..19, base 24..31
+		d[0] = (unsigned char)limit; d[1] = (unsigned char)(limit >> 8);
+		d[2] = (unsigned char)base; d[3] = (unsigned char)(base >> 8);
+		d[4] = (unsigned char)(base >> 16);
+		d[5] = (unsigned char)((flags + 0x8000) >> 8);
+		d[6] = (unsigned char)(flags + ((limit >> 16) & 0x0F));
+		d[7] = (unsigned char)(base >> 24);
+	}
+	emit(d, 8);
+}
+
+// label tss  -- reserves a 104 byte TSS and defines label.field for each field
+static void TssDirective(const char *label)
+{
+	static const struct { const char *name; int off; } fields[] = {
+		{"back", 0}, {"esp0", 4}, {"ss0", 8}, {"esp1", 12}, {"ss1", 16}, {"esp2", 20}, {"ss2", 24},
+		{"cr3", 28}, {"eip", 32}, {"eflags", 36}, {"eax", 40}, {"ecx", 44}, {"edx", 48}, {"ebx", 52},
+		{"esp", 56}, {"ebp", 60}, {"esi", 64}, {"edi", 68}, {"es", 72}, {"cs", 76}, {"ss", 80},
+		{"ds", 84}, {"fs", 88}, {"gs", 92}, {"ldt", 96}, {"trap", 100}, {"io", 102}
+	};
+	char name[LABEL_NAME_MAX * 2], scope[LABEL_NAME_MAX];
+	size_t i;
+
+	Addlabel(label, offset);
+	strcpy(scope, last_global);	// the field labels must not change the .local label scope
+	for(i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+	{
+		snprintf(name, sizeof(name), "%s.%s", label, fields[i].name);
+		if(strlen(name) >= LABEL_NAME_MAX) fatal_error("label name too long");
+		Addlabel(name, offset + fields[i].off);
+	}
+	strcpy(last_global, scope);
+	emit_fill(0, 104);
+}
+
+static void Parsefile(const char *fname);
+
+static void SetBits(char *arg)
+{
+	i64 v = Evaluate(arg, NULL);
+
+	if(v == 16) BITS = 16;
+	else if(v == 32) BITS = 32;
+	else fatal_error("invalid BITS operand, valid operands are 16 and 32 only");
+}
+
+static void SetOrg(char *arg)
+{
+	int unres = 0;
+	i64 v = Evaluate(arg, &unres);
+
+	if(unres) fatal_error("ORG value must not use forward references");
+	if(v < 0 || v > 0xFFFFFFFFLL) fatal_error("ORG value out of range");
+	offset += v;	// gasm behaviour: ORG adds to the current address
+	origin = v;
+}
+
+static void Command(char *line)
+{
+	char *end = strrchr(line, ']');
+	char *cmd, *args;
+
+	if(!end) fatal_error("missing ']'");
+	*end = '\0';
+	if(*trim(end + 1) != '\0') fatal_error("unexpected text after ']'");
+	cmd = trim(line + 1);
+	for(args = cmd; *args && *args != ' ' && *args != '\t'; args++);
+	if(*args) *args++ = '\0';
+	args = trim(args);
+
+	if(!gstricmp(cmd, "org")) SetOrg(args);
+	else if(!gstricmp(cmd, "bits")) SetBits(args);
+	else if(!gstricmp(cmd, "section") || !gstricmp(cmd, "segment") || !gstricmp(cmd, "global") || !gstricmp(cmd, "extern") || !gstricmp(cmd, "cpu")) {}
+	else fatal_error("unknown directive '[%s]'", cmd);
+}
+
+static void Preprocessor(char *line)
+{
+	char *cmd = line, *args;
+
+	for(args = cmd; *args && *args != ' ' && *args != '\t'; args++);
+	if(*args) *args++ = '\0';
+	args = trim(args);
+
+	if(!gstricmp(cmd, "%include"))
+	{
+		char path[1024], saved_file[1024];
+		unsigned long saved_line = line_number;
+		size_t n = strlen(args);
+		FILE *f;
+
+		if(n >= 2 && (args[0] == '"' || args[0] == '\'' || args[0] == '<') && (args[n-1] == '"' || args[n-1] == '\'' || args[n-1] == '>'))
+		{
+			args[n-1] = '\0';
+			args++;
+		}
+		if(*args == '\0') fatal_error("%%include requires a file name");
+		if(strlen(args) >= sizeof(path)) fatal_error("include path too long");
+		strcpy(path, args);
+		// Paths are relative to the current directory, falling back to the including file's directory
+		if((f = fopen(path, "rb")) != NULL) fclose(f);
+		else if(args[0] != '/')
+		{
+			const char *slash = strrchr(filename, '/');
+			if(slash && (size_t)(slash - filename) + 1 + strlen(args) < sizeof(path))
+			{
+				char alt[1024];
+				memcpy(alt, filename, slash - filename + 1);
+				strcpy(alt + (slash - filename + 1), args);
+				if((f = fopen(alt, "rb")) != NULL) { fclose(f); strcpy(path, alt); }
+			}
+		}
+		if(include_depth >= MAX_INCLUDE_DEPTH) fatal_error("includes nested too deeply");
+
+		strcpy(saved_file, filename);
+		include_depth++;
+		Parsefile(path);
+		include_depth--;
+		strcpy(filename, saved_file);
+		line_number = saved_line;
+		return;
+	}
+	fatal_error("unknown preprocessor directive '%s'", cmd);
+}
+
+static const char *const data_directives[] = { "db", "dw", "dd", "resb", "resw", "resd", "desc", "times", "align", "alignb", NULL };
+static const char *const prefix_names[] = { "rep", "repe", "repz", "repne", "repnz", "lock", NULL };
+static const unsigned char prefix_bytes[] = { 0xF3, 0xF3, 0xF3, 0xF2, 0xF2, 0xF0 };
+
+// Reads the leading identifier of s into word; returns its length.
+static int read_word(const char *s, char *word, int max)
+{
+	int len = 0;
+	while(is_ident_char((unsigned char)s[len]))
+	{
+		if(len >= max - 1) fatal_error("identifier too long");
+		word[len] = s[len];
+		len++;
+	}
+	word[len] = '\0';
+	return len;
+}
+
+// Assembles a statement: an instruction or directive, possibly preceded by a colonless label.
+static void AssembleStatement(char *line)
+{
+	char word[LABEL_NAME_MAX], *rest;
+	int len, i;
+	i64 here = offset;
+	t_code code;
+
+	line = trim(line);
+	if(*line == '\0') return;
+
+	len = read_word(line, word, sizeof(word));
+	rest = trim(line + len);
+
+	if(!gstricmp(word, "db")) { DataDirective(1, rest); return; }
+	if(!gstricmp(word, "dw")) { DataDirective(2, rest); return; }
+	if(!gstricmp(word, "dd")) { DataDirective(4, rest); return; }
+	if(!gstricmp(word, "resb")) { ReserveDirective(1, rest); return; }
+	if(!gstricmp(word, "resw")) { ReserveDirective(2, rest); return; }
+	if(!gstricmp(word, "resd")) { ReserveDirective(4, rest); return; }
+	if(!gstricmp(word, "desc")) { DescDirective(rest); return; }
+	if(!gstricmp(word, "bits")) { SetBits(rest); return; }
+	if(!gstricmp(word, "org")) { SetOrg(rest); return; }
+	if(!gstricmp(word, "align") || !gstricmp(word, "alignb"))
+	{
+		char *parts[2];
+		int n = split_commas(rest, parts, 2);
+		i64 a, fill = gstricmp(word, "align") ? 0 : 0x90;	// align pads with NOPs, alignb with zeros
+		if(n < 1) fatal_error("align requires an operand");
+		a = Evaluate(parts[0], NULL);
+		if(a <= 0 || (a & (a - 1))) fatal_error("alignment must be a power of two");
+		if(n == 2)
+		{
+			char *f = parts[1], *k2;
+			if((k2 = match_keyword(f, "db"))) fill = Evaluate(trim(k2), NULL);
+			else if(match_keyword(f, "nop") && *trim(f + 3) == '\0') fill = 0x90;
+			else fill = Evaluate(f, NULL);
+		}
+		emit_fill((unsigned char)fill, (a - (offset % a)) % a);
+		return;
+	}
+	if(!gstricmp(word, "times"))
+	{
+		const char *after;
+		int unres = 0;
+		i64 count, loop;
+		char copy[MAX_LINE];
+
+		count = EvaluatePrefix(rest, &after, &unres);
+		if(count < 0)
+		{
+			if(!unres) fatal_error("TIMES count is negative");
+			count = 0;
+		}
+		if(*after == '\0') fatal_error("TIMES requires an instruction or data");
+		if(count > MAX_OUTPUT) fatal_error("TIMES count too large");
+		read_word(after, copy, LABEL_NAME_MAX);
+		if(count > 1 && in_list(copy, data_directives) && gstricmp(copy, "times") && gstricmp(copy, "align") && gstricmp(copy, "alignb"))
+		{
+			// data does not depend on its position ($ is the start of the line): assemble once and replicate
+			i64 start = offset;
+			size_t start_len = outlen;
+			strcpy(copy, after);
+			AssembleStatement(copy);
+			emit_repeat(start_len, offset - start, count - 1);
+			return;
+		}
+		for(loop = 0; loop < count; loop++)
+		{
+			strcpy(copy, after);	// relative branches depend on each repetition's position
+			AssembleStatement(copy);
+		}
+		return;
+	}
+
+	for(i = 0; prefix_names[i]; i++)
+		if(!gstricmp(word, prefix_names[i]) && *rest)
+		{
+			emit(&prefix_bytes[i], 1);
+			AssembleStatement(rest);
+			return;
+		}
+
+	if(is_instruction(word))
+	{
+		AssembleInstruction(word, rest, here, &code);
+		emit(code.b, code.len);
+		return;
+	}
+
+	// gasm accepts labels without a colon, but only before an instruction or directive
+	if(len > 0 && CheckValidLabel(word) && (line[len] == '\0' || line[len] == ' ' || line[len] == '\t'))
+	{
+		char next[LABEL_NAME_MAX];
+		read_word(rest, next, sizeof(next));
+		if(*rest == '\0' || is_instruction(next) || in_list(next, data_directives) || in_list(next, prefix_names))
+		{
+			Addlabel(word, offset);
+			AssembleStatement(rest);
+			return;
+		}
+		fatal_error("unknown instruction '%s'", word);
+	}
+	fatal_error("syntax error: '%s'", line);
+}
+
+static void AssembleLine(char *line)
+{
+	char word[LABEL_NAME_MAX], *p, *k;
+	int len;
+
+	strip_comment(line);
+	line = trim(line);
+	if(*line == '\0') return;
+	line_start = offset;
+
+	if(line[0] == '[') { Command(line); return; }
+	if(line[0] == '%') { Preprocessor(line); return; }
+
+	len = read_word(line, word, sizeof(word));
+	p = trim(line + len);
+	k = (*p == ':') ? trim(p + 1) : p;
+
+	// name equ value
+	if(len > 0 && !is_instruction(word) && (k = match_keyword(k, "equ")))
+	{
+		k = trim(k);
+		if(*k == '\0') fatal_error("EQU requires a value");
+		Addlabel(word, Evaluate(k, NULL));
+		return;
+	}
+	// name tss
+	k = (*p == ':') ? trim(p + 1) : p;
+	if(len > 0 && !is_instruction(word) && (k = match_keyword(k, "tss")))
+	{
+		if(*trim(k) != '\0') fatal_error("unexpected text after 'tss'");
+		TssDirective(word);
+		return;
+	}
+	// name:
+	if(len > 0 && *p == ':')
+	{
+		Addlabel(word, offset);
+		AssembleStatement(p + 1);
+		return;
+	}
+	AssembleStatement(line);
+}
+
+static void Parsefile(const char *fname)
+{
+	char line[MAX_LINE + 2];
+	FILE *in;
+
+	if(strlen(fname) >= sizeof(filename)) fatal_error("file name too long");
+	if((in = fopen(fname, "rb")) == NULL)
+	{
+		if(filename[0]) fatal_error("unable to open '%s'", fname);
+		fprintf(stderr, "error: unable to open '%s'\n", fname);
+		exit(1);
+	}
+	strcpy(filename, fname);
+	line_number = 0;
+
+	while(fgets(line, sizeof(line), in))
+	{
+		size_t n = strlen(line);
+		line_number++;
+		if(n == sizeof(line) - 1 && line[n-1] != '\n') fatal_error("line too long (maximum %d characters)", MAX_LINE);
+		AssembleLine(line);
+	}
+	fclose(in);
+}
+
+static void RunPass(const char *source)
+{
+	offset = 0;
+	origin = 0;
+	BITS = 16;
+	labels_changed = FALSE;
+	last_global[0] = '\0';
+	filename[0] = '\0';
+	line_number = 0;
+	include_depth = 0;
+	outlen = 0;
+	emitted = 0;
+	Parsefile(source);
+}
+
+// Output file: source name with its extension replaced by .bin
+static void OutputName(const char *src, char *out, size_t outsize)
+{
+	const char *slash = strrchr(src, '/');
+	const char *dot = strrchr(src, '.');
+	size_t n = (dot && dot != src && (!slash || dot > slash + 1)) ? (size_t)(dot - src) : strlen(src);
+
+	if(n + 5 > outsize) { fprintf(stderr, "error: file name too long\n"); exit(1); }
+	memcpy(out, src, n);
+	strcpy(out + n, ".bin");
+}
 
 //**************************************
 // MAIN FUNCTION -=- PROGRAM ENTRY POINT
 //**************************************
-void main(int argc, char **argv)
+int main(int argc, char **argv)
 {
-	char tempstring[500], *newline;
-	int loop=0;
+	char outname[1024];
+	const char *source;
+	FILE *out;
+	int quiet = FALSE, argi = 1;
+	size_t i;
 
-        tempstring[0] = '\0';
+	if(argi < argc && !strcmp(argv[argi], "-q")) { quiet = TRUE; argi++; }
 
-        // Initialise label array
-        for(loop=0; loop<=MAX_LABELS; loop++) {
-		labels[loop].active = FALSE;
-		labels[loop].pass_number = 0;
-	}
-	
-	memcpy(&labels, &predefines, sizeof(predefines));
-
-        printf("GASM  --- Gaz's Assembler v0.55, by Gareth Owen.\n(C)Copyright 1998 by Gareth Owen. All rights reserved\n");
-	printf("http://gasm.cjb.net -=- Contact Gareth Owen at gaz@athene.co.uk\n");
-
-	if(argc != 2)
+	if(!quiet)
 	{
-		printf("\n\nUsage: gasm <source.asm>\n");
+		printf("GASM  --- Gaz's Assembler v0.56, by Gareth Owen.\n(C)Copyright 1998 by Gareth Owen. All rights reserved\n");
+		printf("http://gasm.cjb.net -=- Contact Gareth Owen at gaz@athene.co.uk\n");
+	}
+
+	if(argc - argi < 1 || argc - argi > 2)
+	{
+		printf("\n\nUsage: gasm [-q] <source.asm> [output.bin]\n");
 		exit(1);
 	}
-	
-	for(loop=0; argv[1][loop]!='.' && argv[1][loop]!=(char)NULL; loop++)
-		tempstring[loop] = argv[1][loop];
-
-	tempstring[loop] = (char)NULL;
-
-	strcat(tempstring, ".bin");
-
-      // Open output file
-	if((out = fopen(tempstring, "wb"))==(char)NULL)
-	{
-		perror(tempstring);
-		exit(1);
-	}
-	
-	 // Initialize variables for Pass 1
-	pass_number = 1;
-	offset = 0;
-	line_number = 0;
-
-	for(;pass_number <= 3; pass_number++)
-	{
-		strcpy(filename, argv[1]);
-
-		if(pass_number!=3) Parsefile(FALSE);
-		else Parsefile(TRUE);
-	
-		offset = 0;
-		line_number = 0;
-		BITS = 16;
-	}
-
-	fclose(out);
-}
-
-void Parsefile(char writeoutput)
-{
-	char line[500], *newline=0;
-        FILE *in;
-        t_instruction instruction;      // Stores assembled/compiled instruction
-
-        line[0] = '\0';
-        instruction.length = 0;
-
-	  // Open source file
-	if((in = fopen(filename, "rt"))==(char)NULL)
-	{
-		printf("Error opening %s\n", filename);
-		perror(filename);
-		exit(1);
-	}
-
-	while(!feof(in))
-	{
-		instruction.length = 0;         // Clear instruction length
-                line[0] = '\0';
-                fgets(line, 500, in);   // Read in Line
-                line_number++;          // Increase line number count
-                // Remove any \r's and \n's and make ;s the line terminator
-		for(int loop=0; line[loop]; loop++) if(line[loop]=='\r' || line[loop]=='\n' || line[loop]==';') line[loop]=(char)(char)NULL;
-		newline = line;
-		for(; newline[0]==' ' || newline[0]=='\t'; newline++);	
-
-            instruction = Parseline(newline);  // Parse line to assembler
-		prefixes = 0;
-		
-            // Write assembled/compiled instruction to out file
-		if(writeoutput == TRUE && instruction.length!=0) for(int loop=0; loop<instruction.length; loop++) fputc(instruction.i[loop], out);
-
-                offset += instruction.length;   // Add instruction length to current offset
-                free(instruction.i);            // Free instruction data
-      }
-	fclose (in);
-}
-
-//***************************************************
-// Assembles/compiles instruction from text to binary
-//***************************************************
-
-t_instruction Parseline(char *line)
-{
-        // Just a load of variables that are going to be used
-	t_instruction instruction;
-	t_fixed_instruction finstruction;
-	char *parm1=0, *parm2=0, temp_char=0, temp_modrm=0, temp_string[255], *orig_line;
-	unsigned int parm1_evaluated=0, parm2_evaluated=0;
-	unsigned int loop = 0, temp_count=0, temp_int=0;
-	unsigned long temp_long = 0, modrm_eval;
-
-	temp_p = 0;
-	address_override_disable = 0;
-	address_override_force = 0;
-	size_override_force = 0;
-
-
-	signed char temp_schar = 0;	// for the relative instructions
-	signed int temp_sint = 0;
-	signed long temp_slong = 0;
-
-	t_dynamic_instruction find_dyn_instruction;     // Used searching for dynamic instruction
-
-      find_dyn_instruction.opcode_length = 0;         // Set to zero..
-	
-	orig_line = (char *) malloc(strlen(line) + 1);
-	strcpy(orig_line, line);
-	
-	temp_count = 0;
-
-        // Initialize final instruction variables
-        instruction.length = 0;
-        instruction.i = (unsigned char *) malloc(100);
-
-	if(strstr(line, "s:"))
-	{
-		if(strstr(line, "cs:")) { prefixes |= PREFIX_CS; remstring(line, "cs:"); instruction.i[temp_count] = 0x2E; temp_count++; parm1_evaluated = Evaluator(line);}
-		if(strstr(line, "ds:")) { prefixes |= PREFIX_DS; remstring(line, "ds:"); instruction.i[temp_count] = 0x3E; temp_count++; parm1_evaluated = Evaluator(line);}
-		if(strstr(line, "es:")) { prefixes |= PREFIX_ES; remstring(line, "es:"); instruction.i[temp_count] = 0x26; temp_count++; parm1_evaluated = Evaluator(line);}
-		if(strstr(line, "fs:")) { prefixes |= PREFIX_FS; remstring(line, "fs:"); instruction.i[temp_count] = 0x64; temp_count++; parm1_evaluated = Evaluator(line);}
-		if(strstr(line, "gs:")) { prefixes |= PREFIX_GS; remstring(line, "gs:"); instruction.i[temp_count] = 0x65; temp_count++; parm1_evaluated = Evaluator(line);}
-		if(strstr(line, "ss:")) { prefixes |= PREFIX_SS; remstring(line, "ss:"); instruction.i[temp_count] = 0x36; temp_count++; parm1_evaluated = Evaluator(line);}
-	}
-
-
-	// override prefixes
-	if(prefixes & PREFIX_REPNZ) { instruction.i[temp_count] = 0xF2; temp_count++; }
-	if(prefixes & PREFIX_REPZ) { instruction.i[temp_count] = 0xF3; temp_count++; }
-	if(prefixes & PREFIX_LOCK) { instruction.i[temp_count] = 0xF0; temp_count++; }
-	if(prefixes & PREFIX_REP) { instruction.i[temp_count] = 0xF3; temp_count++; }
-
-	       temp_p = strtok(line, " \t");     // temp_p stores instruction name, i couldn't think of a more imaginative name, sorry :-)
-        if(!temp_p) return instruction; 
-
-	        // Get parameter one to the instruction
-	parm1 = strtok((char)NULL, ",");
-
-	if(parm1) while((parm1[0] == ' ' || parm1[0] == '\t') && parm1[0]!=(char)NULL) if (parm1[0]==' ' || parm1[0]=='\t') parm1++;
-	if(parm1) for(loop=(strlen(parm1)-1); loop!=0 && (parm1[loop]==' ' || parm1[loop]=='\t'); loop--) if(parm1[loop] == ' ' || parm1[loop] == '\t') parm1[loop]=(char)NULL;
-
-        if(!gstrnicmp(parm1, "equ", 3)) { HandleEQU(orig_line); return instruction; }
-        if(!gstrnicmp(parm1, "tss", 3))  return Handletss(orig_line);
-
-        if(isInstruction(temp_p)==FALSE || !gstrnicmp(temp_p, "rep", 3)) goto notinstruction;
-
-	if(parm1) 
-	{          
-	    // Process any size overrides
-            if(strstr(parm1, "byte"))
-		{
-			remstring(parm1, "byte");	
-			parm1_evaluated = Evaluator(parm1);
-
-			if(parm1_evaluated == EVALUATE_REGM32) { parm1_evaluated = EVALUATE_REGM8; address_override_force = TRUE; }
-			if(parm1_evaluated == EVALUATE_REGM16) parm1_evaluated = EVALUATE_REGM8;
-		}
-		else if(strstr(parm1, "word") && !strstr(parm1, "dword"))
-		{		
-			remstring(parm1, "word");
-			parm1_evaluated = Evaluator(parm1);
-
-			if(parm1_evaluated == EVALUATE_IMM8) parm1_evaluated = EVALUATE_IMM16;
-		}
-		else if(strstr(parm1, "dword"))
-		{
-			remstring(parm1, "dword");
-			parm1_evaluated = Evaluator(parm1);
-			
-			if(parm1_evaluated == EVALUATE_REGM16) { parm1_evaluated = EVALUATE_REGM32; address_override_disable = TRUE; }
-			if(parm1_evaluated == EVALUATE_PTR16_PTR16) parm1_evaluated =  EVALUATE_PTR16_PTR32;
-		}
-		else parm1_evaluated = Evaluator(parm1);
-	} else parm1_evaluated = EVALUATE_NONE;
-
-	if(parm1) while((parm1[0] == ' ' || parm1[0] == '\t') && parm1[0]!=(char)NULL) if (parm1[0]==' ' || parm1[0]=='\t') parm1++;
-	if(parm1) for(loop=(strlen(parm1)-1); loop!=0 && (parm1[loop]==' ' || parm1[loop]=='\t'); loop--) if(parm1[loop] == ' ' || parm1[loop] == '\t') parm1[loop]=(char)NULL;
-
-
-        // Get parameter two of instruction
-	parm2 = strtok((char)NULL, ",");
-
-	if(parm2) 
-	{
-                // Process any size overrides
-                if(strstr(parm2, "byte"))
-		{
-			remstring(parm2, "byte");
-			parm2_evaluated = Evaluator(parm2);
-
-			if(parm2_evaluated == EVALUATE_REGM16) parm2_evaluated = EVALUATE_REGM8;
-			if(parm2_evaluated == EVALUATE_REGM32) { parm2_evaluated = EVALUATE_REGM8; address_override_force = TRUE; }
-		}
-		else if(strstr(parm2, "word") && !strstr(parm2, "dword"))
-		{
-			remstring(parm2, "word");
-			parm2_evaluated = Evaluator(parm2);
-
-			if(parm2_evaluated == EVALUATE_IMM8) parm2_evaluated = EVALUATE_IMM16;
-		}
-		else if(strstr(parm2, "dword"))
-		{
-			remstring(parm2, "dword");
-			parm2_evaluated = Evaluator(parm2);
-
-			if(parm2_evaluated == EVALUATE_REGM16) { parm2_evaluated = EVALUATE_REGM32; address_override_disable = TRUE; }
-			if(parm1_evaluated == EVALUATE_PTR16_PTR16) parm1_evaluated =  EVALUATE_PTR16_PTR32;
-		}
-		else parm2_evaluated = Evaluator(parm2);
-	} else parm2_evaluated = EVALUATE_NONE;
-
-	if(parm2) while((parm2[0] == ' ' || parm2[0] == '\t') && parm2[0]!=(char)NULL) if(parm2[0]==' ' || parm2[0]=='\t') parm2++;
-	if(parm2) for(loop=(strlen(parm2)-1); loop!=0 && (parm2[loop]==' ' || parm2[loop]=='\t'); loop--) if(parm2[loop] == ' ' || parm2[loop] == '\t') parm2[loop]=(char)NULL;
-
-	loop = 0;
-
-	 // If the instruction has no parameters, then its a fixed instruction
-	if(parm1_evaluated == EVALUATE_NONE && parm2_evaluated == EVALUATE_NONE)
-	{
-fixed_instruction:                
-		finstruction = FindFixedInstruction(temp_p);    // Try and find it...
-
-		if((BITS == 16 && finstruction.bits == 32) || (BITS == 32 && finstruction.bits == 16)) { instruction.i[temp_count] = 0x66; instruction.i[temp_count+1] = 0x67; temp_count+=2; }
-		
-                // Return it if it was found
-		if(finstruction.length!=0)
-		{
-			instruction.length = finstruction.length + temp_count;
-
-			instruction.i[temp_count] = finstruction.c1; temp_count++;
-			if(finstruction.length == 2 || finstruction.length == 3) { instruction.i[temp_count] = finstruction.c2; temp_count++; }
-			if(finstruction.length == 3) { instruction.i[temp_count] = finstruction.c3; temp_count++; }
-
-			return instruction;
-		}
-	}
-        // Use some intelligence to realise that if the parameter is
-        // an IMM8, and the instruction only supports IMM16, then we can still
-        // do it....(this function does a lot more too!)
-	find_dyn_instruction = AutoModify(parm1_evaluated, parm2_evaluated, parm1, parm2, temp_p);
-
-        // Looks like that variation of the instruction wasn't found, possibly because
-        // of invalid parameters, or something
-notinstruction:
-	if(find_dyn_instruction.opcode_length == 0)
-	{
-		    if(!gstricmp(temp_p, "pop") && parm1_evaluated == EVALUATE_SREG) return popSeg(parm1);
-                if(!gstricmp(temp_p, "push") && parm1_evaluated == EVALUATE_SREG) return pushSeg(parm1);
-		    if(!gstricmp(temp_p, "desc")) return Handledesc(orig_line);
-
-                if(!gstricmp(temp_p, "repne") || !gstricmp(temp_p, "repnz")) prefixes |= PREFIX_REPNZ;
-                if(!gstricmp(temp_p, "repe") || !gstricmp(temp_p, "repz")) prefixes |= PREFIX_REPZ;
-                if(!gstricmp(temp_p, "rep")) prefixes |= PREFIX_REP;
-                if(!gstricmp(temp_p, "lock")) prefixes |= PREFIX_LOCK;
-                if(!gstricmp(temp_p, "repne") || !gstricmp(temp_p, "repnz") || !gstricmp(temp_p, "repz") || !gstricmp(temp_p, "repe") || !gstricmp(temp_p, "rep") || !gstricmp(temp_p, "lock"))
-		    {
-				for(;orig_line[0]!=(char)' ' && orig_line[0]!=(char)'\t' && orig_line[0]!=(char)(char)NULL; orig_line++);
-				for(;(orig_line[0]==(char)' ' || orig_line[0]==(char)'\t') && orig_line[0]!=(char)(char)NULL; orig_line++);
-
-				if(orig_line[0] == (char)NULL) goto fixed_instruction;
-
-				return Parseline(orig_line);
-		    }
-		
-		if(isInstruction(temp_p)==TRUE) // Is there an instruction by that name?
-                	fatal_error("You have entered arguments not possible for the instruction");
-			
-
-                if(!gstricmp(temp_p, "db") || !gstricmp(temp_p, "dd") || !gstricmp(temp_p, "dw")) return DataType(orig_line);
-                if(!gstricmp(temp_p, "times")) return Handletimes(orig_line);
-		if(temp_p[0]=='[') { Command(orig_line); return instruction; }
-		if(temp_p[0]=='%') { Preprocessor(orig_line); return instruction; }
-
-                // If the instruction wasn't found as dynamic or fixed, then we
-                // must assume its a label
-
-		if(temp_p[strlen(temp_p)-1]==':') 
-		{
-			temp_p[strlen(temp_p)-1]=(char)(char)NULL;
-			Addlabel(temp_p, offset);
-			temp_p[strlen(temp_p)] = ':';
-		}
-		else Addlabel(temp_p, offset);
-
-		for(;orig_line[0]!=(char)' ' && orig_line[0]!=(char)'\t' && orig_line[0]!=(char)(char)NULL; orig_line++);
-		for(;(orig_line[0]==(char)' ' || orig_line[0]==(char)'\t') && orig_line[0]!=(char)(char)NULL; orig_line++);
-
-		if(orig_line[0]==(char)(char)NULL)
-		{
-			instruction.length = 0;
-			return instruction;
-		}
-
-		return Parseline(orig_line);	
-	}
-
-	  // By now, we have found the instruction in our database, now to assemble it
-        // with operands etc..
-
-        // Does the instruction need the 32bit overrides?
-      if((parm1_evaluated == EVALUATE_IMM32 || parm1_evaluated == EVALUATE_REG32 || parm2_evaluated == EVALUATE_IMM32 || parm2_evaluated == EVALUATE_REG32 || parm1_evaluated == EVALUATE_EAX || parm2_evaluated == EVALUATE_EAX || Evaluator(parm1)==EVALUATE_REG32 || Evaluator(parm2)==EVALUATE_REG32 || parm1_evaluated == EVALUATE_PTR16_PTR32 || parm2_evaluated == EVALUATE_PTR16_PTR32) && BITS == 16)
-	{
-		if(parm1_evaluated!=EVALUATE_CREG && parm2_evaluated!=EVALUATE_CREG)
-		{
-			instruction.i[temp_count] = 0x66;
-			temp_count++;
-		}
-	}
-        if((((parm1_evaluated == EVALUATE_REGM32 || parm2_evaluated == EVALUATE_REGM32 || (find_dyn_instruction.format & FORMAT_REL32)) && address_override_disable == FALSE) && BITS == 16) || address_override_force == TRUE)
-	{
-		if(parm1_evaluated!=EVALUATE_CREG && parm2_evaluated!=EVALUATE_CREG)
-		{
-			instruction.i[temp_count] = 0x67;
-			temp_count++;
-			address_override_force = 0;
-		}
-	}
-	if(!(parm1_evaluated == EVALUATE_IMM32 || parm1_evaluated == EVALUATE_REG32 || parm2_evaluated == EVALUATE_IMM32 || parm2_evaluated == EVALUATE_REG32 || parm1_evaluated == EVALUATE_EAX || parm2_evaluated == EVALUATE_EAX || Evaluator(parm1)==EVALUATE_REG32 || Evaluator(parm2)==EVALUATE_REG32 || parm1_evaluated == EVALUATE_PTR16_PTR32 || parm2_evaluated == EVALUATE_PTR16_PTR32) && BITS == 32)
-	{
-		if(parm1_evaluated!=EVALUATE_CREG && parm2_evaluated!=EVALUATE_CREG)
-		{
-			instruction.i[temp_count] = 0x66;
-			temp_count++;
-		}
-	}
-        if((!((parm1_evaluated == EVALUATE_REGM32 || parm2_evaluated == EVALUATE_REGM32 || (find_dyn_instruction.format & FORMAT_REL32)) && address_override_disable == FALSE) && BITS == 32) || address_override_force == TRUE)
-	{
-		if(parm1_evaluated!=EVALUATE_CREG && parm2_evaluated!=EVALUATE_CREG)
-		{
-			instruction.i[temp_count] = 0x67;
-			temp_count++;
-			address_override_force = 0;
-		}
-	}	
-
-
-        // Now put the opcode in..
-	instruction.i[temp_count] = find_dyn_instruction.c1;
-	temp_count++;
-	if(find_dyn_instruction.opcode_length == 2) { instruction.i[temp_count] = find_dyn_instruction.c2; temp_count++; }
-	if(find_dyn_instruction.opcode_length == 3) { instruction.i[temp_count] = find_dyn_instruction.c3; temp_count+=2; }
-	
-	if(find_dyn_instruction.format & FORMAT_REGPLUSOP)	// Do we have to add the register to the opcode ?
-	{
-		if(parm1_evaluated == EVALUATE_REG8 || parm1_evaluated == EVALUATE_REG16 || parm1_evaluated == EVALUATE_REG32) instruction.i[temp_count-1] += FindRegister(parm1);
-		if(parm2_evaluated == EVALUATE_REG8 || parm2_evaluated == EVALUATE_REG16 || parm2_evaluated == EVALUATE_REG32) instruction.i[temp_count-1] += FindRegister(parm2);
-	}
-
-        // If we need a MOD-RM byte, then calculate what it is....
-// *********************** MOD-RM BYTE CALCULATOR ***************************
-	if(find_dyn_instruction.format & FORMAT_MODRM)
-	{
-                // We cannot have two REGMs for one instruction...
-                if((parm1_evaluated == EVALUATE_REGM8 || parm1_evaluated == EVALUATE_REGM16) && (parm2_evaluated == EVALUATE_REGM8 || parm2_evaluated == EVALUATE_REGM16))
-				fatal_error("You cannot have two memory operands per instruction!");
-
-                // We cannot have two REGs for one instruction... or can we?
-                // Yes we can, we'll use the REGM part of the MODRM byte
-		if(parm1_evaluated == EVALUATE_REG8 && (parm2_evaluated == EVALUATE_REG8 || parm2_evaluated == EVALUATE_REG16))
-			parm1_evaluated = EVALUATE_REGM8;
-		if(parm1_evaluated == EVALUATE_REG16 && (parm2_evaluated == EVALUATE_REG8 || parm2_evaluated == EVALUATE_REG16))
-			parm1_evaluated = EVALUATE_REGM16;
-	
-		modrm_eval = 0;
-		temp_modrm = 0;
-
-                // Now calculate the MODRM part for the REGM (if applicable)
-        	if(parm1_evaluated == EVALUATE_REGM16 || parm1_evaluated == EVALUATE_REGM8 || parm1_evaluated == EVALUATE_REGM32)
-		{
-			modrm_eval = Eval2(parm1, 0, parm1_evaluated);
-			temp_modrm += FindModRM(modrm_eval);
-		}
-                // Now to the registers..
-		if(parm1_evaluated == EVALUATE_REG8 || parm1_evaluated == EVALUATE_REG16 || parm1_evaluated == EVALUATE_REG32)
-		{
-                        if(!gstricmp("ax", parm1) || !gstricmp("al", parm1) || !gstricmp("eax", parm1)) temp_modrm |= 0x00;
-                        if(!gstricmp("bx", parm1) || !gstricmp("bl", parm1) || !gstricmp("ebx", parm1)) temp_modrm |= 0x18;
-                        if(!gstricmp("cx", parm1) || !gstricmp("cl", parm1) || !gstricmp("ecx", parm1)) temp_modrm |= 0x08;
-                        if(!gstricmp("dx", parm1) || !gstricmp("dl", parm1) || !gstricmp("edx", parm1)) temp_modrm |= 0x10;
-                        if(!gstricmp("si", parm1) || !gstricmp("dh", parm1) || !gstricmp("esi", parm1)) temp_modrm |= 0x30;
-                        if(!gstricmp("di", parm1) || !gstricmp("bh", parm1) || !gstricmp("edi", parm1)) temp_modrm |= 0x38;
-                        if(!gstricmp("bp", parm1) || !gstricmp("ch", parm1) || !gstricmp("ebp", parm1)) temp_modrm |= 0x28;
-                        if(!gstricmp("sp", parm1) || !gstricmp("ah", parm1) || !gstricmp("esp", parm1)) temp_modrm |= 0x20;
-		}
-                // Now do the REGM part of the MODRM for parameter two (if applicable) 
-		if(parm2_evaluated == EVALUATE_REGM16 || parm2_evaluated == EVALUATE_REGM8 || parm2_evaluated == EVALUATE_REGM32)
-		{
-			modrm_eval = Eval2(parm2, 0, parm2_evaluated);
-			temp_modrm += FindModRM(modrm_eval);
-		}
-                // Now do the REGs
-		if(parm2_evaluated == EVALUATE_REG8 || parm2_evaluated == EVALUATE_REG16 || parm2_evaluated == EVALUATE_REG32)
-		{
-                        if(!gstricmp("ax", parm2) || !gstricmp("al", parm2) || !gstricmp("eax", parm2)) temp_modrm |= 0x00;
-                        if(!gstricmp("bx", parm2) || !gstricmp("bl", parm2) || !gstricmp("ebx", parm2)) temp_modrm |= 0x18;
-                        if(!gstricmp("cx", parm2) || !gstricmp("cl", parm2) || !gstricmp("ecx", parm2)) temp_modrm |= 0x08;
-                        if(!gstricmp("dx", parm2) || !gstricmp("dl", parm2) || !gstricmp("edx", parm2)) temp_modrm |= 0x10;
-                        if(!gstricmp("si", parm2) || !gstricmp("dh", parm2) || !gstricmp("esi", parm2)) temp_modrm |= 0x30;
-                        if(!gstricmp("di", parm2) || !gstricmp("bh", parm2) || !gstricmp("edi", parm2)) temp_modrm |= 0x38;
-                        if(!gstricmp("bp", parm2) || !gstricmp("ch", parm2) || !gstricmp("ebp", parm2)) temp_modrm |= 0x28;
-                        if(!gstricmp("sp", parm2) || !gstricmp("ah", parm2) || !gstricmp("esp", parm2)) temp_modrm |= 0x20;
-		}
-		if(parm1_evaluated == EVALUATE_SREG)
-			temp_modrm += SegmentRegister(parm1);
-		if(parm2_evaluated == EVALUATE_SREG)
-			temp_modrm += SegmentRegister(parm2);
-		if(parm1_evaluated == EVALUATE_CREG)
-			temp_modrm += ControlRegister(parm1);
-		if(parm2_evaluated == EVALUATE_CREG)
-			temp_modrm += ControlRegister(parm2);
-		if(parm1_evaluated == EVALUATE_DREG)
-			temp_modrm += DebugRegister(parm1);
-		if(parm2_evaluated == EVALUATE_DREG)
-			temp_modrm += DebugRegister(parm2);
-
-                // Add the initial modrm byte to the calculated one
-		    temp_modrm += find_dyn_instruction.initial_modrm;
-                instruction.i[temp_count] = temp_modrm;         // put it into the instruction
-                temp_count++;           // Increase our instruction size count
-		
-                // Get any displacement that might exist (REGM only)
-		if((modrm_eval & MODRM_FORMAT_DISP8) || (modrm_eval & MODRM_FORMAT_DISP16) || (modrm_eval & MODRM_FORMAT_DISP32)) GetDisplacement(parm1, temp_string);
-                if(((modrm_eval & MODRM_FORMAT_DISP8) || (modrm_eval & MODRM_FORMAT_DISP16) || (modrm_eval & MODRM_FORMAT_DISP32)) && !gstricmp(temp_string, "")) GetDisplacement(parm2, temp_string);
-
-             // Put them into the instruction
-		if(modrm_eval & MODRM_FORMAT_DISP8)
-		{
-			temp_char = StringtoChar(temp_string);
-			instruction.i[temp_count] = temp_char;
-			temp_count++;
-		}
-		else if(modrm_eval & MODRM_FORMAT_DISP16)
-		{
-			temp_int = StringtoInt(temp_string);
-			memcpy(&instruction.i[temp_count], &temp_int, 2);
-			temp_count+=2;
-		}
-		else if(modrm_eval & MODRM_FORMAT_DISP32)
-		{
-			temp_long = StringtoLong(temp_string);
-			memcpy(&instruction.i[temp_count], &temp_long, 4);
-			temp_count+=4;
-		}
-	}
-//*************************** MOD-RM BYTE CALCULATOR END *********************************
-// Now calculate any parameters that are NOT relative to itself
-if(!(find_dyn_instruction.format & FORMAT_REL8 || find_dyn_instruction.format & FORMAT_REL16 || find_dyn_instruction.format & FORMAT_REL32))
-{
-	switch(parm1_evaluated)
-	{
-		case EVALUATE_IMM8: 	temp_char = StringtoChar(parm1);
-					instruction.i[temp_count] = temp_char;
-					temp_count++;
-					break;
-			
-		case EVALUATE_IMM16:	temp_int = StringtoInt(parm1);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					break;
-	
-		case EVALUATE_IMM32:	temp_long = StringtoLong(parm1);
-					memcpy(&instruction.i[temp_count], &temp_long, 4);
-					temp_count+=4;
-					break;
-		
-		case EVALUATE_PTR16_PTR16:
-					temp_int = (unsigned int)GetOffset(parm1);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					temp_int = (unsigned int) GetSegment(parm1);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					break;
-		
-		case EVALUATE_PTR16_PTR32:
-					temp_long = GetOffset(parm1);
-					memcpy(&instruction.i[temp_count], &temp_long, 4);
-					temp_count+=4;
-					temp_int = GetSegment(parm1);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					break;
-
-		default: break;
-	}
-	switch(parm2_evaluated)
-	{
-		case EVALUATE_IMM8: 	temp_char = StringtoChar(parm2);
-					instruction.i[temp_count] = temp_char;
-					temp_count++;
-					break;
-		
-		case EVALUATE_IMM16:	temp_int = StringtoInt(parm2);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					break;
-	
-		case EVALUATE_IMM32:	temp_long = StringtoLong(parm2);
-					memcpy(&instruction.i[temp_count], &temp_long, 4);
-					temp_count+=4;
-					break;
-
-		case EVALUATE_PTR16_PTR16:
-					temp_int = (unsigned int)GetOffset(parm1);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					temp_int = (unsigned int) GetSegment(parm1);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					break;
-		
-		case EVALUATE_PTR16_PTR32:
-					temp_long = GetOffset(parm1);
-					memcpy(&instruction.i[temp_count], &temp_long, 4);
-					temp_count+=4;
-					temp_int = GetSegment(parm1);
-					memcpy(&instruction.i[temp_count], &temp_int, 2);
-					temp_count+=2;
-					break;
-		
-		default: break;
-	}
-}
-// Now add any RELATIVES
-if(find_dyn_instruction.format & FORMAT_REL8 || find_dyn_instruction.format & FORMAT_REL16 || find_dyn_instruction.format & FORMAT_REL32)
-{
-	switch(parm1_evaluated)
-	{
-            	case EVALUATE_IMM8:
-						temp_char = StringtoChar(parm1);
-						temp_schar = (offset+temp_count+1) - temp_char;
-						temp_schar = 0 - temp_schar;
-						instruction.i[temp_count] = temp_schar;
-						temp_count++;
-						break;
-		
-		case EVALUATE_IMM16:		temp_int = StringtoInt(parm1);
-						temp_sint = (offset+temp_count+2) - temp_int;	// relative to end of instruction...
-						temp_sint = 0 - temp_sint;
-						memcpy(&instruction.i[temp_count], &temp_sint, 2);
-						temp_count += 2;
-						break;
-		
-		case EVALUATE_IMM32:		temp_long = StringtoLong(parm1);
-						temp_slong = (offset+temp_count+4) - temp_long;	// relative to end of instruction...
-						temp_slong = 0 - temp_slong;
-						memcpy(&instruction.i[temp_count], &temp_slong, 4);
-						temp_count += 4;
-						break;
-	}
-	switch(parm2_evaluated)
-	{
-            	case EVALUATE_IMM8: 		temp_char = StringtoChar(parm2);
-						temp_schar = (offset+temp_count+1) - temp_char;
-						temp_schar = 0 - temp_schar;
-						instruction.i[temp_count] = temp_schar;
-						temp_count++;
-						break;
-		
-		case EVALUATE_IMM16:		temp_int = StringtoInt(parm2);
-						temp_sint = (offset+temp_count+2) - temp_int;	// relative to end of instruction...
-						temp_sint = 0 - temp_sint;
-						memcpy(&instruction.i[temp_count], &temp_sint, 2);
-						temp_count += 2;
-						break;
-		
-		case EVALUATE_IMM32:		temp_long = StringtoLong(parm2);
-						temp_slong = (offset+temp_count+4) - temp_long;	// relative to end of instruction...
-						temp_slong = 0 - temp_slong;
-						memcpy(&instruction.i[temp_count], &temp_slong, 4);
-						temp_count += 4;
-						break;
-	}
-}                 
-	
-        // Now just return the data
-	instruction.length = temp_count;
-	return instruction;
-}
-
-//**********************************************
-// StringtoInt: Converts a string to an integer.
-// Can be a label, equation, decimal, hex, etc..
-//**********************************************
-unsigned int StringtoInt(char *string)
-{
-	char *endp;	
-	char temp_string[255];
-	t_label label;
-	int loop=0;
-
-	while((string[0]==' ' || string[0]=='\t') && string[0]!=(char)NULL) if(string[0]==' ' || string[0]=='\t') string++;
-	for(loop=(strlen(string)-1); loop!=0 && (string[loop]==' ' || string[loop]=='\t'); loop--) if(string[loop] == ' ' || string[loop] == '\t') string[loop]=(char)NULL;
-        if(!gstricmp(string, "")) return 0;
-        if(!gstricmp(string, "$")) return (int) offset;
-	
-	if(string[0]=='-')
-	{
-		strcpy(temp_string, string+1);
-		return 0 - StringtoInt(temp_string);
-	}
-
-	if(Contains(string, '+') || Contains(string, '-') || Contains(string, '*') || Contains(string, '/'))
-		return (unsigned int) SolveEquation(string);
-
-      if(!gstrnicmp(string, "0x", 2))
-	{
-		return (unsigned int) strtol(string, &endp, 0);
-	}
-	if(string[strlen(string)-1]=='h' && isHex(string))
-	{
-		strcpy(temp_string, "0x");
-		string[strlen(string)-1]=(char)(char)NULL;
-		strcat(temp_string, string);
-		string[strlen(string)]='h';	// NOTE: string length has decreased
-
-		return (unsigned int) strtol(temp_string, &endp, 0);
-	}
-	if(string[0]==39 && string[2]==39)	// 'a', 'b', etc
-	{
-		return (unsigned int) string[1];
-	}	
-	if(isdigit(string[0]))
-	{
-		return atoi(string);
-	}
-
-	// Not normal number, most probably label..
-        gstrlwr(string);
-	label = Findlabel(string);
-	if(label.active == TRUE) return (int) label.m_offset;
-	if(pass_number > 1) 
-		fatal_error("Undefined label/identifier"); 
-	
-	return 0x1;	// Return smallest possible value instead if not found... not 0 to avoid divide by 0
-}
-
-//**********************************************
-// StringtoChar: Converts a string to an char.
-// Can be a label, equation, decimal, hex, etc..
-//**********************************************
-unsigned char StringtoChar(char *string)
-{
-	char *endp;	
-	char temp_string[255];
-	t_label label;
-	int loop=0;	
-
-	while((string[0]==' ' || string[0]=='\t') && string[0]!=(char)NULL) if(string[0]==' ' || string[0]=='\t') string++;
-	for(loop=(strlen(string)-1); loop!=0 && (string[loop]==' ' || string[loop]=='\t'); loop--) if(string[loop] == ' ' || string[loop] == '\t') string[loop]=(char)NULL;
-
-        if(!gstricmp(string, "")) return 0;
-        if(!gstricmp(string, "$")) return (char) offset;
-
-	if(string[0]=='-')
-	{
-		strcpy(temp_string, string+1);
-		return 0 - StringtoChar(temp_string);
-	}
-
-	if(Contains(string, '+') || Contains(string, '-') || Contains(string, '*') || Contains(string, '/'))
-		return (unsigned char) SolveEquation(string);
-
-        if(!gstrnicmp(string, "0x", 2))
-	{
-		return (unsigned char) strtol(string, &endp, 0);
-	}
-	if(string[strlen(string)-1]=='h' && isHex(string))
-	{
-		strcpy(temp_string, "0x");
-		string[strlen(string)-1]=(char)(char)NULL;
-		strcat(temp_string, string);
-		string[strlen(string)]='h';	// NOTE: string length has decreased
-
-		return (unsigned char) strtol(temp_string, &endp, 0);
-	}
-	if(string[0]==39 && string[2]==39)	// 'a', 'b', etc
-	{
-		return string[1];
-	}
-	if(isdigit(string[0]))
-	{
-		return (unsigned char) atoi(string);
-	}
-
-	// Not normal number, most probably label..
-        gstrlwr(string);
-	label = Findlabel(string);
-	if(label.active == TRUE) return (char) label.m_offset;
-	if(pass_number > 1) 
-		fatal_error("Undefined label/identifier"); 
-
-
-	return 0x1;	// Return smallest possible value instead if not found... not 0 to avoid divide by 0
-}
-
-//**********************************************
-// StringtoLong: Converts a string to an long.
-// Can be a label, equation, decimal, hex, etc..
-//**********************************************
-unsigned long StringtoLong(char *string)
-{
-	char *endp;	
-	char temp_string[255];
-	t_label label;
-	int loop=0;
-
-	while((string[0]==' ' || string[0]=='\t') && string[0]!=(char)NULL)  if(string[0]==' ' || string[0]=='\t') string++;
-	for(loop=(strlen(string)-1); loop!=0 && (string[loop]==' ' || string[loop]=='\t'); loop--) if(string[loop] == ' ' || string[loop] == '\t') string[loop]=(char)NULL;
-
-        if(!gstricmp(string, "")) return 0;
-        if(!gstricmp(string, "$")) return offset;
-
-	if(string[0]=='-')
-	{
-		strcpy(temp_string, string+1);
-		return 0 - StringtoLong(temp_string);
-	}
-
-	if(Contains(string, '(') || Contains(string, ')') || Contains(string, '+') || Contains(string, '-') || Contains(string, '*') || Contains(string, '/'))
-		return SolveEquation(string);
-
-        if(!gstrnicmp(string, "0x", 2))
-	{
-		return strtol(string, &endp, 0);
-	}
-	if(string[strlen(string)-1]=='h' && isHex(string))
-	{
-		strcpy(temp_string, "0x");
-		string[strlen(string)-1]=(char)(char)NULL;
-		strcat(temp_string, string);
-		string[strlen(string)]='h';		// NOTE: string length has decreased
-
-		return strtol(temp_string, &endp, 0);
-	}
-	if(string[0]==39 && string[2]==39)	// 'a', 'b', etc
-	{
-		return (unsigned long) string[1];
-	}
-	if(isdigit(string[0]))
-	{
-		return atol(string);
-	}
-
-	// Not normal number, most probably label..
-        gstrlwr(string);
-	label = Findlabel(string);
-	if(label.active == TRUE) return label.m_offset;
-	if(pass_number > 1) 
-		fatal_error("Undefined label/identifier");
-
-	return 0x01;	// Return smallest possible value instead if not found... not 0 to avoid divide by 0
-}
-
-//**********************************************************
-// Evaluator: Evaluates a parameter
-// Finds out whether it is an immediate, REGM, pointer, etc.
-//**********************************************************
-unsigned int Evaluator(char *e_string)
-{
-        unsigned int loop=0, loop2=0, temp=0;
-	t_label labell;
-	char temp_string[255], *endp;
-	unsigned long temp_long=0;
-	signed long temp_slong = 0;
-        char temp_bracket_string[255], eval1=0;
-
-        // Just make sure that the string isn't (char)NULL, crashes otherwise :-/
-	if(!e_string) return EVALUATE_NONE;
-	for(loop=0; e_string[loop]!=(char)(char)NULL && (e_string[loop]==(char)' ' || e_string[loop]==(char)'\t'); loop++);
-	if(e_string[loop]==(char)(char)NULL) return EVALUATE_ERROR;
-	loop=0;
-
-	while((e_string[0] == ' ' || e_string[0] == '\t') && e_string[0]!=(char)NULL) if(e_string[0]==' ' || e_string[0]=='\t') e_string++;
-	for(loop=(strlen(e_string)-1); loop!=0 && (e_string[loop]==' ' || e_string[loop]=='\t'); loop--) if(e_string[loop] == ' ' || e_string[loop] == '\t') e_string[loop]=(char)NULL;
-
-        if(!gstricmp(e_string, "ax") || !gstricmp(e_string, "bx") || !gstricmp(e_string, "cx") || !gstricmp(e_string, "dx") ||
-                        !gstricmp(e_string, "sp") || !gstricmp(e_string, "bp") || !gstricmp(e_string, "si") || !gstricmp(e_string, "di"))
-		return EVALUATE_REG16;
-	
-        if(!gstricmp(e_string, "al") || !gstricmp(e_string, "cl") || !gstricmp(e_string, "dl") || !gstricmp(e_string, "bl") ||
-                        !gstricmp(e_string, "ah") || !gstricmp(e_string, "ch") || !gstricmp(e_string, "dh") || !gstricmp(e_string, "bh"))
-		return EVALUATE_REG8;
-        if(!gstricmp(e_string, "eax") || !gstricmp(e_string, "ecx") || !gstricmp(e_string, "edx") || !gstricmp(e_string, "ebx") ||
-                        !gstricmp(e_string, "esp") || !gstricmp(e_string, "ebp") || !gstricmp(e_string, "esi") || !gstricmp(e_string, "edi"))
-		return EVALUATE_REG32;
-	if(isSegmentRegister(e_string)==TRUE) return EVALUATE_SREG;
-	if(isControlRegister(e_string)==TRUE) return EVALUATE_CREG;
-	if(isDebugRegister(e_string)==TRUE) return EVALUATE_DREG;
-
-	
-        if((!gstrnicmp(e_string, "0x", 2) || e_string[strlen(e_string)-1]=='h' || (e_string[0]==39 && e_string[2]==39)  || isdigit(e_string[0])) && (Contains(e_string, ':')==FALSE) && isRelativeInstruction(temp_p)==TRUE)
-	{
-		temp_long = StringtoLong(e_string);
-		temp_slong = (offset+5) - temp_long;
-		temp_slong = 0 - temp_slong;
-
-		if(temp_slong>-128 && temp_slong<128) return EVALUATE_IMM8;	
-		else if(temp_slong>-65536 && temp_slong<65536) return EVALUATE_IMM16;
-		else if(temp_slong<-65536 || temp_slong>65536) return EVALUATE_IMM32;
-	}
-        if((e_string[0]=='{' || !gstrnicmp(e_string, "0x", 2) || e_string[strlen(e_string)-1]=='h' || (e_string[0]==39 && e_string[2]==39) || isdigit(e_string[0]) || strchr(e_string, '+') || strchr(e_string, '-') || strchr(e_string, '*') || strchr(e_string, '/')) && ((Contains(e_string, ':')==FALSE) && !strchr(e_string, ']') && !strchr(e_string, '[')))
-	{
-		/*temp_long = StringtoLong(e_string);
-						
-                if(temp_long <=0xFF) return EVALUATE_IMM8;
-		if(temp_long >=0x100 && temp_long <=0xFFFF) return EVALUATE_IMM16;
-		if(temp_long >=0x10000) return EVALUATE_IMM32;*/
-
-		temp_slong = StringtoLong(e_string);
-		
-		if(temp_slong >=-127 && temp_slong <=127) return EVALUATE_IMM8;
-		if(temp_slong >= -65535 && temp_slong <= 65535) return EVALUATE_IMM16;
-		if(temp_slong < -65535 || temp_slong > 65535) return EVALUATE_IMM32;
-                
-                return EVALUATE_ERROR;
-	}
-	
-      if(e_string[0]=='[')
-	{
-		for(loop=1;e_string[loop]!=']' && e_string[loop]!=(char)NULL;loop++)
-		{
-			for(loop2=0; e_string[loop]!='+' && e_string[loop]!='*' && e_string[loop]!='-' && e_string[loop]!=(char)NULL && e_string[loop]!=']'; loop2++)
-			{
-				temp_string[loop2] = e_string[loop];
-				loop++;
-			}
-			temp_string[loop2] = (char)NULL;
-					
-			temp = Evaluator(temp_string);
-			
-			if(temp == EVALUATE_REG8) return EVALUATE_REGM8;
-			if(temp == EVALUATE_REG16) return EVALUATE_REGM16;
-			if(temp == EVALUATE_REG32) return EVALUATE_REGM32;
-		}
-		if(temp == EVALUATE_IMM8) return EVALUATE_REGM16;
-		if(temp == EVALUATE_IMM16) return EVALUATE_REGM16;
-		if(temp == EVALUATE_IMM32) return EVALUATE_REGM32;
-	}
-	
-        if(Contains(e_string, ':')==TRUE)
-	{
-		// Segment offset something..
-		int anotherloop = 0;	
-		
-		for(loop=0; e_string[loop]!=':' && e_string[loop]!=(char)(char)NULL; loop++);		
-		loop++;
-		
-		for(anotherloop=0;e_string[loop]!=(char)(char)NULL; loop++)
-		{
-			temp_bracket_string[anotherloop] = e_string[loop];
-			anotherloop++;
-		}
-		temp_bracket_string[anotherloop] = (char)(char)NULL;
-
-		eval1 = 0;
-		eval1 = Evaluator(temp_bracket_string);
-		if((eval1==EVALUATE_REG8 || eval1==EVALUATE_IMM8) && e_string[0]=='[') 
-			return EVALUATE_REGM8;
-		if((eval1==EVALUATE_REG16 || eval1==EVALUATE_IMM16) && e_string[0]=='[')
-			return EVALUATE_REGM16;
-		if((eval1==EVALUATE_REG32 || eval1==EVALUATE_IMM32) && e_string[0]=='[')
-			return EVALUATE_REGM32;
-		if(eval1==EVALUATE_REG8 || eval1==EVALUATE_IMM8)
-			return EVALUATE_PTR16_PTR16;
-		if(eval1==EVALUATE_REG16 || eval1==EVALUATE_IMM16)
-			return EVALUATE_PTR16_PTR16;
-		if(eval1==EVALUATE_REG32 || eval1==EVALUATE_IMM32)
-			return EVALUATE_PTR16_PTR32;
-	
-		return EVALUATE_ERROR;
-	}
-	
-	if(labell.active!=FALSE)
-	{
-		if(isRelativeInstruction(temp_p)==FALSE)
-		{
-			if(labell.m_offset >= 0 && labell.m_offset <=255) return EVALUATE_IMM8;
-			if(labell.m_offset >=256 && labell.m_offset <=65535) return EVALUATE_IMM16;
-			if(labell.m_offset >=65536) return EVALUATE_IMM32;
-		}
-		else
-		{
-			temp_long = StringtoLong(e_string);
-			temp_slong = (offset+4) - temp_long;
-			temp_slong = 0 - temp_slong;
-
-			if(temp_slong>-128 && temp_slong<128) return EVALUATE_IMM8;	
-			else if(temp_slong>-65536 && temp_slong<65536) return EVALUATE_IMM16;
-			else if(temp_slong<-65536 || temp_slong>65536) return EVALUATE_IMM32;
-	
-
-		}
-	}
-	if(CheckValidLabel(e_string)==TRUE)
-	{
-		temp_long = StringtoLong(e_string);
-		
-                if(temp_long <=0xFF) return EVALUATE_IMM8;
-		if(temp_long >=0x100 && temp_long <=0xFFFF) return EVALUATE_IMM16;
-		if(temp_long >=0x10000) return EVALUATE_IMM32;
-	}
-	
-	return EVALUATE_ERROR;
-}
-
-//*************************
-// Findlabel: Finds a label
-// in the label array
-//*************************
-t_label Findlabel(char *label_name)
-{
-	int loop=0;	
-	t_label label;
-
-        for(loop=0; loop<MAX_LABELS; loop++)
-                if(!gstricmp(label_name, labels[loop].l_name))
-			return labels[loop];
-
-	// Not found..
-	label.active = FALSE;
-	return label;
-}
-
-//******************************************
-// Addlabel: Adds a label to the label array
-// Overrites if previous entry was entered
-// on a different pass
-//******************************************
-void Addlabel(char *label_name, long moffset)
-{
-	int loop=0;
-
-	if(CheckValidLabel(label_name)==FALSE)
-		fatal_error("Invalid label name");
-	
-        for(loop=0; gstricmp(label_name, labels[loop].l_name) && loop<MAX_LABELS; loop++);
-
-        if(!gstricmp(label_name, labels[loop].l_name) && pass_number == labels[loop].pass_number) 
-		fatal_error("Duplicate label name found");
-        else if(!gstricmp(label_name, labels[loop].l_name)) { labels[loop].m_offset = moffset; labels[loop].pass_number = pass_number; return; }
-	
-        for(loop=0; labels[loop].active!=FALSE && loop<MAX_LABELS; loop++);
-
-	strcpy(labels[loop].l_name, label_name);
-	labels[loop].m_offset = moffset;
-	labels[loop].pass_number = pass_number;
-	labels[loop].active = TRUE;
-}
-		
-//*********************************************
-// FindDynamicInstruction: Finds an instruction
-// with any parameters
-//*********************************************
-t_dynamic_instruction FindDynamicInstruction(char *ins_name, unsigned int parm1, unsigned int parm2)
-{
-	int loop=0;
-	t_dynamic_instruction dyn_instr;
-
-	for(loop=0; dynamic_lookup[loop].opcode_length!=0; loop++)
-                if(!gstricmp(ins_name, dynamic_lookup[loop].instruction) && dynamic_lookup[loop].parm1 == parm1 && dynamic_lookup[loop].parm2 == parm2)
-			return dynamic_lookup[loop];
-			
-	dyn_instr.opcode_length = 0;	// Set length to zero, to indicate nothing found ...
-	return dyn_instr;
-}
-
-//********************************
-// Eval2: Evaluates a REGM and
-// returns the evaluated value for
-// lookup in the REGM table
-//********************************
-unsigned long Eval2(char *e_string, char inbrackets, unsigned int evaluated)
-{
-	unsigned int temp_modrm=0, loop=0, loop2=0;	
-	signed long temp_slong = 0;
-	char temp_string[255];
-
-	if(!e_string) return 0;
-
-	if(e_string[0]=='[')
-	{
-		temp_modrm = MODRM_FORMAT_INBRACK;		
-
-		for(loop=1;e_string[loop]!=']' && e_string[loop]!=(char)NULL;loop++)
-		{
-			for(loop2=0; e_string[loop]!='+' && e_string[loop]!='*' && e_string[loop]!='-' && e_string[loop]!=(char)NULL && e_string[loop]!=']'; loop2++)
-			{
-				temp_string[loop2] = e_string[loop];
-				loop++;
-			}
-			temp_string[loop2] = (char)NULL;
-					
-                        if(gstricmp(temp_string, "")) temp_modrm |= Eval2(temp_string, 1, evaluated);
-		}
-	}
-        if(!gstricmp("al", e_string)) return MODRM_FORMAT_AX;
-      if(!gstricmp("bl", e_string)) return MODRM_FORMAT_BX;
-      if(!gstricmp("cl", e_string)) return MODRM_FORMAT_CX;
-      if(!gstricmp("dl", e_string)) return MODRM_FORMAT_DX;
-      if(!gstricmp("dh", e_string)) return MODRM_FORMAT_SI;
-      if(!gstricmp("bh", e_string)) return MODRM_FORMAT_DI;
-      if(!gstricmp("ch", e_string)) return MODRM_FORMAT_BP;
-      if(!gstricmp("ah", e_string)) return MODRM_FORMAT_SP;
-
-      if(!gstricmp("ax", e_string)) return MODRM_FORMAT_AX;
-      if(!gstricmp("bx", e_string)) return MODRM_FORMAT_BX;
-      if(!gstricmp("cx", e_string)) return MODRM_FORMAT_CX;
-      if(!gstricmp("dx", e_string)) return MODRM_FORMAT_DX;
-      if(!gstricmp("si", e_string)) return MODRM_FORMAT_SI;
-      if(!gstricmp("di", e_string)) return MODRM_FORMAT_DI;
-      if(!gstricmp("bp", e_string)) return MODRM_FORMAT_BP;
-      if(!gstricmp("sp", e_string)) return MODRM_FORMAT_SP;
-
-        if(!gstricmp("eax", e_string)) return MODRM_FORMAT_EAX;
-      if(!gstricmp("ebx", e_string)) return MODRM_FORMAT_EBX;
-      if(!gstricmp("ecx", e_string)) return MODRM_FORMAT_ECX;
-      if(!gstricmp("edx", e_string)) return MODRM_FORMAT_EDX;
-      if(!gstricmp("esi", e_string)) return MODRM_FORMAT_ESI;
-      if(!gstricmp("edi", e_string)) return MODRM_FORMAT_EDI;
-      if(!gstricmp("ebp", e_string)) return MODRM_FORMAT_EBP;
-      if(!gstricmp("esp", e_string)) return MODRM_FORMAT_ESP;
-
-	if(inbrackets == 0)
-	{
-		GetDisplacement(e_string, temp_string);
-
-		temp_slong = StringtoLong(temp_string);
-		
-		if(temp_slong != 0)
-		{
-			if(temp_slong >= -127 && temp_slong <= 127) temp_modrm |= MODRM_FORMAT_DISP8;
-			else if(temp_slong >= -65535 && temp_slong <= 65535) temp_modrm |= MODRM_FORMAT_DISP16;
-			else if(temp_slong < 65535 || temp_slong > 65535) temp_modrm |= MODRM_FORMAT_DISP32;
-		}
-	}
-
-	return temp_modrm;
-}
-
-//**************************
-// GetDisplacement: Gets any
-// displacement in a REGM
-//**************************
-void GetDisplacement(char *d_string, char *displacement)
-{
-	unsigned int temp_eval=0, loop=0, loop2=0, w_operator=0;
-	char temp_string[255];
-
-        temp_string[0] = '\0';
-        displacement[0] = '\0';
-
-	if(!d_string) return;
-
-	if(d_string[0]=='[')
-	{
-		for(loop=1; d_string[loop]!=']' && d_string[loop]!=(char)NULL && d_string[loop]!='+' && d_string[loop]!='-' && d_string[loop]!='*'; loop++)
-		{
-			temp_string[loop2] = d_string[loop];
-			loop2++;
-		}
-		temp_string[loop2] = (char)NULL;
-		w_operator = '+';
-
-		temp_eval = Evaluator(temp_string);
-		if(temp_eval==EVALUATE_IMM8 || temp_eval == EVALUATE_IMM16 || temp_eval == EVALUATE_IMM32)
-			strcpy(displacement, temp_string);
-
-		w_operator = d_string[loop];
-		loop++;
-		for(;d_string[loop]!=']' && d_string[loop]!=(char)NULL; loop++)
-		{
-			for(loop2=0; d_string[loop]!=']' && d_string[loop]!=(char)NULL && d_string[loop]!='+' && d_string[loop]!='-' && d_string[loop]!='*'; loop2++)
-			{
-				temp_string[loop2] = d_string[loop];
-				loop++;
-			}
-			temp_string[loop2] = (char)NULL;
-
-			temp_eval = Evaluator(temp_string);		
-
-			if(temp_eval == EVALUATE_IMM8 || temp_eval == EVALUATE_IMM16 || temp_eval == EVALUATE_IMM32)
-			{
-                                if(w_operator == '+' && gstricmp(displacement, "")) strcat(displacement, "+");
-				if(w_operator == '-') strcat(displacement, "-");
-				if(w_operator == '*') strcat(displacement, "*");
-
-				strcat(displacement, temp_string);
-			}
-			w_operator = d_string[loop];
-		}
-	}
-}
-
-//*************************************
-// FindModRM: Takes the evaluated MODRM
-// and finds it in the lookup table
-//*************************************
-unsigned char FindModRM(unsigned long &modrm_evaluated)
-{
-	int loop=0;
-
-	for(loop=0; modrm_lookup[loop].format != 0; loop++)
-		if(modrm_lookup[loop].format == modrm_evaluated) return modrm_lookup[loop].modrm_byte;
-
-	if(modrm_evaluated & MODRM_FORMAT_DISP8)
-	{
-		modrm_evaluated &= (modrm_evaluated - MODRM_FORMAT_DISP8);
-		modrm_evaluated |= MODRM_FORMAT_DISP16;
-	
-		for(loop=0; modrm_lookup[loop].format != 0; loop++)
-			if(modrm_lookup[loop].format == modrm_evaluated) return modrm_lookup[loop].modrm_byte;
-	}
-
-	if(modrm_evaluated & MODRM_FORMAT_DISP16)
-	{
-		modrm_evaluated &= (modrm_evaluated - MODRM_FORMAT_DISP16);
-		modrm_evaluated |= MODRM_FORMAT_DISP32;
-	
-		for(loop=0; modrm_lookup[loop].format != 0; loop++)
-			if(modrm_lookup[loop].format == modrm_evaluated) return modrm_lookup[loop].modrm_byte;
-	}
-
-	fatal_error("Invalid arguments in memory operand");
-        return 0;
-}
-
-//***********************************************
-// AutoModify: Automatically modifys
-// parameters to be found in the lookup
-// tables... eg. IMM8 can also be IMM16.
-// Of course, this function does more than that..
-//***********************************************
-t_dynamic_instruction AutoModify(unsigned int &parm1_evaluated, unsigned int &parm2_evaluated, char *parm1, char *parm2, char *temp_p)
-{
-	t_dynamic_instruction find_dyn_instruction;
-
-	find_dyn_instruction.opcode_length = 0;
-
-	unsigned int temp_parm1=0, temp_parm2=0;
-
-	temp_parm1 = parm1_evaluated;
-	temp_parm2 = parm2_evaluated;
-
-	find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	if(find_dyn_instruction.opcode_length != 0) return find_dyn_instruction;
-
-	find_dyn_instruction = Parm1_Modify(parm1_evaluated, parm2_evaluated, parm1, parm2, temp_p);
-	if(find_dyn_instruction.opcode_length != 0) return find_dyn_instruction;
-
-	parm1_evaluated = temp_parm1;
-
-	find_dyn_instruction = Parm2_Modify(parm1_evaluated, parm2_evaluated, parm1, parm2, temp_p);
-	if(find_dyn_instruction.opcode_length != 0) return find_dyn_instruction;
-
-	parm2_evaluated = temp_parm2;
-
-	find_dyn_instruction = Parm1_Modify(parm1_evaluated, parm2_evaluated, parm1, parm2, temp_p);
-	find_dyn_instruction = Parm2_Modify(parm1_evaluated, parm2_evaluated, parm1, parm2, temp_p);
-	if(find_dyn_instruction.opcode_length != 0) return find_dyn_instruction;
-
-	parm1_evaluated = temp_parm1;
-	parm2_evaluated = temp_parm2;
-
-	find_dyn_instruction = Parm2_Modify(parm1_evaluated, parm2_evaluated, parm1, parm2, temp_p);
-	find_dyn_instruction = Parm1_Modify(parm1_evaluated, parm2_evaluated, parm1, parm2, temp_p);
-	if(find_dyn_instruction.opcode_length != 0) return find_dyn_instruction;
-
-	find_dyn_instruction.opcode_length = 0;
-	return find_dyn_instruction;
-
-}
-
-// See AutoModify description
-t_dynamic_instruction Parm1_Modify(unsigned int &parm1_evaluated, unsigned int &parm2_evaluated, char *parm1, char *parm2, char *temp_p)
-{
-	t_dynamic_instruction find_dyn_instruction;	
-	int parm2_evaluated_temp = parm2_evaluated;
-
-	find_dyn_instruction.opcode_length = 0;
-
-	if(parm1_evaluated!=EVALUATE_NONE)
-      {     
-                if(!gstricmp(parm1, "al")) { parm1_evaluated = EVALUATE_AL; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm1, "ax")) { parm1_evaluated = EVALUATE_AX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm1, "eax")) { parm1_evaluated = EVALUATE_EAX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm1, "dx")) { parm1_evaluated = EVALUATE_DX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm1, "cl")) { parm1_evaluated = EVALUATE_CL; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-
-                if(!gstricmp(parm2, "dx")) { parm2_evaluated = EVALUATE_DX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_AL) parm1_evaluated = EVALUATE_REG8;
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_AX) parm1_evaluated = EVALUATE_REG16;
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_EAX) parm1_evaluated = EVALUATE_REG32;
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_DX) parm1_evaluated = EVALUATE_REG16;
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_DX) parm2_evaluated = parm2_evaluated_temp;
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_CL) parm1_evaluated = EVALUATE_REG8;
-
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_IMM16 && StringtoLong(parm1)<256)
-	{
-		parm1_evaluated = EVALUATE_IMM8;
-
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-		if(find_dyn_instruction.opcode_length == 0) parm1_evaluated = EVALUATE_IMM16;
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_IMM32 && StringtoLong(parm1)<=65535)
-	{
-		parm1_evaluated = EVALUATE_IMM16;
-
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-		if(find_dyn_instruction.opcode_length == 0) parm1_evaluated = EVALUATE_IMM32;
-	}
-
-
-	if(find_dyn_instruction.opcode_length == 0 && (parm1_evaluated == EVALUATE_IMM8 || parm1_evaluated == EVALUATE_IMM16))
-	{
-		parm1_evaluated = EVALUATE_IMM16;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-		if(find_dyn_instruction.opcode_length == 0)
-		{
-			parm1_evaluated = EVALUATE_IMM32;
-			find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-		}
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_REG8)
-	{
-		parm1_evaluated = EVALUATE_REGM8;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_REG16)
-	{
-		parm1_evaluated = EVALUATE_REGM16;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_REG32)
-	{
-		parm1_evaluated = EVALUATE_REGM32;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	}
-	if(find_dyn_instruction.opcode_length == 0 && (parm1_evaluated == EVALUATE_REG16 || parm1_evaluated == EVALUATE_REG32) && parm2_evaluated == EVALUATE_NONE)
-	{
-		switch(parm1_evaluated)
-		{
-			case EVALUATE_REG16: parm1_evaluated = EVALUATE_REGM16; break;
-			case EVALUATE_REG32: parm1_evaluated = EVALUATE_REGM32; break;
-		}
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	}
-
-	return find_dyn_instruction;
-}
-
-// See AutoModify description
-t_dynamic_instruction Parm2_Modify(unsigned int &parm1_evaluated, unsigned int &parm2_evaluated, char *parm1, char *parm2, char *temp_p)
-{
-	t_dynamic_instruction find_dyn_instruction;	
-	int parm1_evaluated_temp = parm1_evaluated;
-	
-	find_dyn_instruction.opcode_length = 0;
-
-	if(parm2_evaluated!=EVALUATE_NONE)
-     	{
-                if(!gstricmp(parm2, "al")) { parm2_evaluated = EVALUATE_AL; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm2, "ax")) { parm2_evaluated = EVALUATE_AX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm2, "eax")) { parm2_evaluated = EVALUATE_EAX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm2, "dx")) { parm2_evaluated = EVALUATE_DX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-                else if(!gstricmp(parm2, "cl")) { parm2_evaluated = EVALUATE_CL; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-
-                if(!gstricmp(parm1, "dx")) { parm1_evaluated = EVALUATE_DX; find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated); }
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_AL) parm2_evaluated = EVALUATE_REG8;
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_AX) parm2_evaluated = EVALUATE_REG16;
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_EAX) parm2_evaluated = EVALUATE_REG32;
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_DX) parm2_evaluated = EVALUATE_REG16;
-	if(find_dyn_instruction.opcode_length == 0 && parm1_evaluated == EVALUATE_DX) parm1_evaluated = parm1_evaluated_temp;
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_CL) parm2_evaluated = EVALUATE_REG8;
-
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_IMM16 && StringtoLong(parm2)<256)
-	{
-		parm2_evaluated = EVALUATE_IMM8;
-
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-		if(find_dyn_instruction.opcode_length == 0) parm2_evaluated = EVALUATE_IMM16;
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_IMM32 && StringtoLong(parm2)<=65535)
-	{
-		parm2_evaluated = EVALUATE_IMM16;
-
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-		if(find_dyn_instruction.opcode_length == 0) parm2_evaluated = EVALUATE_IMM32;
-	}
-
-	if(find_dyn_instruction.opcode_length == 0 && (parm2_evaluated == EVALUATE_IMM8 || parm2_evaluated == EVALUATE_IMM16))
-	{
-		parm2_evaluated = EVALUATE_IMM16;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-
-		if(find_dyn_instruction.opcode_length == 0)
-		{
-			parm2_evaluated = EVALUATE_IMM32;
-			find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-		}
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_REG8)
-	{
-		parm2_evaluated = EVALUATE_REGM8;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_REG16)
-	{
-		parm2_evaluated = EVALUATE_REGM16;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	}
-	if(find_dyn_instruction.opcode_length == 0 && parm2_evaluated == EVALUATE_REG32)
-	{
-		parm2_evaluated = EVALUATE_REGM32;
-		find_dyn_instruction = FindDynamicInstruction(temp_p, parm1_evaluated, parm2_evaluated);
-	}
-
-	
-	return find_dyn_instruction;
-}
-
-//************************************
-// GetRelative:
-// Gets the relative address in a REGM
-//************************************
-signed long GetRelative(char *address, unsigned long instructionend)
-{
-	unsigned long temp_long=0;
-	signed long temp_slong=0;	
-
-	temp_long = StringtoLong(address);
-	temp_slong = (instructionend) - temp_long;	// relative to end of instruction...
-	temp_slong = 0 - temp_slong;
-	
-	return temp_slong;
-}
-
-//****************************
-// CheckValidLabel:
-// Does the string comply with
-// label rules?
-//****************************
-unsigned char CheckValidLabel(char *label_name)
-{
-	int loop=0;
-	
-	for(loop=0; loop<strlen(label_name); loop++)
-		if(isalnum(label_name[loop])==0 && label_name[loop]!='_' && label_name[loop]!='.') { return FALSE; }
-
-        if(!gstrnicmp(label_name, "0x", 2)) return FALSE;        // Cannot start "0x" !
-
-	return TRUE;
-}
-
-//**********************************
-// GetSegment: Gets the segment
-// in a 0x03:0x04, where the segment
-// is 0x03 in this case
-//**********************************
-unsigned int GetSegment(char *s_string)
-{
-	int loop=0;
-	char temp_string[255];
-
-	for(loop=0; s_string[loop]!=(char)':' && s_string[loop]!=(char)(char)NULL; loop++)
-		temp_string[loop] = s_string[loop];
-
-	temp_string[loop] = (char)(char)NULL;
-
-	return StringtoInt(temp_string);
-}
-
-//*********************************
-// GetOffset: Gets the offset
-// in a 0x03:0x04, where the offset
-// is 0x04 in this case
-//*********************************
-unsigned long GetOffset(char *s_string)
-{
-	int loop=0, loop2=0;
-	char temp_string[255];
-
-	for(loop=0; s_string[loop]!=(char)':' && s_string[loop]!=(char)(char)NULL; loop++);	
-
-	loop++;
-
-	for(; s_string[loop]!=(char)(char)NULL; loop++)
-	{
-		temp_string[loop2] = s_string[loop];
-		loop2++;
-	}
-
-	temp_string[loop2] = (char)(char)NULL;
-
-	return StringtoLong(temp_string);
-}
-
-//***********************************
-// Contains: Does c_string contain c?
-//***********************************
-char Contains(char *c_string, char c)
-{
-	int loop = 0;
-
-	for(loop=0; loop<strlen(c_string); loop++)
-		if(c_string[loop]==c) return TRUE;
-
-	return FALSE;
-}
-
-//***********************************
-// FindFixedInstruction: Finds an
-// instruction without any parameters
-//***********************************
-t_fixed_instruction FindFixedInstruction(char *instruction)
-{
-	int loop = 0;
-	t_fixed_instruction fi_temp;
-
-	for(loop=0; fixed_instruction_lookup[loop].length!=0; loop++)
-                if(!gstricmp(instruction, fixed_instruction_lookup[loop].i_name)) return fixed_instruction_lookup[loop];
-
-	fi_temp.length = 0;
-	return fi_temp;
-}	
-
-//**********************************
-// SolveEquation: Solves an equation
-// eg. 3 + 4 = 7
-//**********************************
-unsigned long SolveEquation(char *equation)
-{
-	unsigned int loop=0, loop2=0;
-	unsigned long result=0;
-	char temp_string[255];
-
-	while((equation[0]==' ' || equation[0]=='\t') && equation[0]!=(char)NULL) if(equation[0]==' ' || equation[0]=='\t') equation++;
-        if(!gstricmp(equation, "")) return 0;
-
-	if(equation[loop]!='(')
-        {
-                	for(loop2=0; equation[loop]!=(char)(char)NULL && equation[loop]!='+' && equation[loop]!='-' && equation[loop]!='*' && equation[loop]!='/'; loop++)
-                	{       temp_string[loop2] = equation[loop]; loop2++;   }
-	
-                	temp_string[loop2] = (char)(char)NULL;
-			result = StringtoLong(temp_string);
-        }
-        else
-        {
-                	strcpy(temp_string, equation+loop);
-                	ExtractBrackets(temp_string);
-			loop+= (strlen(temp_string) + 2);
-		    	result = SolveEquation(temp_string);
-        }
-	
-	while(loop<strlen(equation))
-	{
-		if(equation[loop]=='+')
-		{
-			loop++;
-			while((equation[loop]==' ' || equation[loop]=='\t') && equation[loop]!=(char)NULL) if(equation[loop]==' ' || equation[loop]=='\t') loop++;
-			
-			if(equation[loop]!='(') {
-				for(loop2=0; equation[loop]!=(char)(char)NULL && equation[loop]!='+' && equation[loop]!='-' && equation[loop]!='*' && equation[loop]!='/'; loop++)
-				{	temp_string[loop2] = equation[loop]; loop2++;	}
-	
-				temp_string[loop2] = (char)(char)NULL;
-				result += StringtoLong(temp_string);
-			}
-			else
-			{
-				strcpy(temp_string, equation+loop);
-				ExtractBrackets(temp_string);
-				loop+= (strlen(temp_string)+ 2);
-			    	result += SolveEquation(temp_string);
-			}
-		}
-		if(equation[loop]=='-')
-		{
-			loop++;
-			while((equation[loop]==' ' || equation[loop]=='\t') && equation[loop]!=(char)NULL) if(equation[loop]==' ' || equation[loop]=='\t') loop++;
-
-			if(equation[loop]!='(') {
-				for(loop2=0; equation[loop]!=(char)(char)NULL && equation[loop]!='+' && equation[loop]!='-' && equation[loop]!='*' && equation[loop]!='/'; loop++)
-				{	temp_string[loop2] = equation[loop]; loop2++;	}
-	
-				temp_string[loop2] = (char)(char)NULL;
-				result -= StringtoLong(temp_string);
-			}
-			else
-			{
-				strcpy(temp_string, equation+loop);
-				ExtractBrackets(temp_string);
-				loop+= (strlen(temp_string)+2);
-			    	result -= SolveEquation(temp_string);
-			}
-		}
-		if(equation[loop]=='*')
-		{
-			loop++;
-			while((equation[loop]==' ' || equation[loop]=='\t') && equation[loop]!=(char)NULL) if(equation[loop]==' ' || equation[loop]=='\t') loop++;
-
-			if(equation[loop]!='(') {
-				for(loop2=0; equation[loop]!=(char)(char)NULL && equation[loop]!='+' && equation[loop]!='-' && equation[loop]!='*' && equation[loop]!='/'; loop++)
-				{	temp_string[loop2] = equation[loop]; loop2++;	}
-	
-				temp_string[loop2] = (char)(char)NULL;
-				result *= StringtoLong(temp_string);
-			}
-			else
-			{
-				strcpy(temp_string, equation+loop);
-				ExtractBrackets(temp_string);
-				loop+= (strlen(temp_string)+2);
-			    	result *= SolveEquation(temp_string);
-			}
-		}
-		if(equation[loop]=='/')
-		{
-			loop++;
-			while((equation[loop]==' ' || equation[loop]=='\t') && equation[loop]!=(char)NULL) if(equation[loop]==' ' || equation[loop]=='\t') loop++;
-
-			if(equation[loop]!='(') {
-				for(loop2=0; equation[loop]!=(char)(char)NULL && equation[loop]!='+' && equation[loop]!='-' && equation[loop]!='*' && equation[loop]!='/'; loop++)
-				{	temp_string[loop2] = equation[loop]; loop2++;	}
-	
-				temp_string[loop2] = (char)(char)NULL;
-				
-				if(StringtoLong(temp_string)==0)
-					fatal_error("Attempted divide by 0");
-					
-				result /= StringtoLong(temp_string);
-			}
-			else
-			{
-				strcpy(temp_string, equation+loop);
-				ExtractBrackets(temp_string);
-				loop += (strlen(temp_string)+2);
-				if(SolveEquation(temp_string)==0)
-					fatal_error("Attempted divide by 0");
-				
-			    	result /= SolveEquation(temp_string);
-			}
-		}
-		if(equation[loop]==' ' || equation[loop]=='\t') loop++;
-		if(equation[loop] == (char)NULL) break;
-	}
-
-	return result;
-}
-
-// If there are brackets then this will extract the contents until the finish
-// Parse string in string, string is returned in string aswell
-
-void ExtractBrackets(char *string)
-{
-	unsigned int loop=0, loop2 = 0, brackets = 0;
-	char temp_string[255];
-	if(string[0]!='(') return;
-
-        temp_string[0] = '\0';
-
-	while((string[0]==' ' || string[0]=='\t') && string[0]!=(char)NULL)  if(string[0]==' ' || string[0]=='\t') string++;
-        if(!gstricmp(string, "")) return;
-
-	loop++; // Get past first bracket..
-	brackets = 1; // one open bracket
-
-	for(; (!(string[loop]==')' && brackets == 0)) && string[loop]!=(char)NULL; loop++)
-	{
-		if(brackets!=0) 
-		{
-			temp_string[loop2] = string[loop];
-			if(string[loop]=='(') brackets++;
-			if(string[loop]==')') brackets--;
-			loop2++;
-		} 
-	}
-	loop2--;	// Clear ending bracket
-	temp_string[loop2] = (char)NULL;
-
-	strcpy(string, temp_string);
-}
-
-//**************************************
-// isInstruction: Is the string an
-// instruction (either fixed or dynamic)
-//**************************************
-char isInstruction(char *i_string)
-{
-	int loop=0;
-
-	for(loop=0; fixed_instruction_lookup[loop].length!=0; loop++)
-                if(!gstricmp(i_string, fixed_instruction_lookup[loop].i_name)) return TRUE;
-
-	for(loop=0; dynamic_lookup[loop].opcode_length!=0; loop++)
-                if(!gstricmp(i_string, dynamic_lookup[loop].instruction)) return TRUE;
-
-	return FALSE;
-}
-
-char isSegmentRegister(char *seg_reg)
-{
-        if(!gstricmp(seg_reg, "es") || !gstricmp(seg_reg, "cs") || !gstricmp(seg_reg, "ss") || !gstricmp(seg_reg, "ds") || 
-           !gstricmp(seg_reg, "fs") || !gstricmp(seg_reg, "gs")) return TRUE;
-
-	return FALSE;
-}
-
-char SegmentRegister(char *seg_reg)
-{
-        if(!gstricmp(seg_reg, "es")) return 0x0;
-        if(!gstricmp(seg_reg, "cs")) return 0x8;
-        if(!gstricmp(seg_reg, "ss")) return 0x10;
-        if(!gstricmp(seg_reg, "ds")) return 0x18;
-        if(!gstricmp(seg_reg, "fs")) return 0x20;
-        if(!gstricmp(seg_reg, "gs")) return 0x28;
-
-	fatal_error("Invalid segment register, internal error\n");
-        return 0; // Keep Borland happy
-}
-
-char isControlRegister(char *control_reg)
-{
-        if(!gstricmp(control_reg, "cr0") || !gstricmp(control_reg, "cr2") || !gstricmp(control_reg, "cr3") || !gstricmp(control_reg, "cr4")) return TRUE;
-
-	return FALSE;
-}
-
-char ControlRegister(char *control_reg)
-{
-        if(!gstricmp(control_reg, "cr0")) return 0x0;
-        if(!gstricmp(control_reg, "cr2")) return 0x10;
-        if(!gstricmp(control_reg, "cr3")) return 0x18;
-        if(!gstricmp(control_reg, "cr4")) return 0x20;
-	
-	fatal_error("Invalid control register, internal error");
-        return 0;
-}
-
-char isDebugRegister(char *debug_reg)
-{
-        if(!gstricmp(debug_reg, "dr0") || !gstricmp(debug_reg, "dr1") || !gstricmp(debug_reg, "dr2") || !gstricmp(debug_reg, "dr3") || 
-           !gstricmp(debug_reg, "dr4") || !gstricmp(debug_reg, "dr5") || !gstricmp(debug_reg, "dr6") || !gstricmp(debug_reg, "dr7")) return TRUE;
-
-	return FALSE;
-}
-
-char DebugRegister(char *debug_reg)
-{
-        if(!gstricmp(debug_reg, "dr0")) return 0x0;
-        if(!gstricmp(debug_reg, "dr1")) return 0x8;
-        if(!gstricmp(debug_reg, "dr2")) return 0x10;
-        if(!gstricmp(debug_reg, "dr3")) return 0x18;
-        if(!gstricmp(debug_reg, "dr4")) return 0x20;
-        if(!gstricmp(debug_reg, "dr5")) return 0x28;
-        if(!gstricmp(debug_reg, "dr6")) return 0x30;
-        if(!gstricmp(debug_reg, "dr7")) return 0x38;
-
-	fatal_error("Invalid debug register, internal error");
-        return 0;
-}
-
-t_instruction DataType(char *line)
-{
-	char *dtype, *alldata, data[255], firsttime = 0;
-	t_instruction instruction;
-	unsigned int count = 0, loop=0, dataloop=0, temp_int=0;
-	unsigned long temp_long=0;
-
-        instruction.length = 0;
-        if(!line) return instruction;
-	instruction.i = (unsigned char *)malloc(500);
-
-	dtype = strtok(line, " \t");
-	alldata = strtok(NULL, "\n");
-
-        if(!dtype || !alldata) return instruction;
-
-        gstrlwr(dtype);
-
-        for(dataloop=0; (alldata[dataloop]==' ' || alldata[dataloop]=='\t') && alldata[dataloop]!='\0'; dataloop++);
-	loop=0;
-	data[0] = (char)NULL;
-	firsttime = 1;
-
-	while(data[0]!=(char)NULL || firsttime==1)
-	{
-                if(!gstricmp(dtype, "db"))
-		{
-			if(data[0]==39)
-			{
-				for(loop=1; data[loop]!=39 && data[loop]!=(char)NULL; loop++)
-				{
-					instruction.i[count] = data[loop];
-					count++;
-				}
-			}
-			else if(data[0] == 34)
-			{
-				for(loop=1; data[loop]!=34 && data[loop]!=(char)NULL; loop++)
-				{
-					instruction.i[count] = data[loop];
-					count++;
-				}
-			}
-			else if(data[0]!=(char)NULL)
-			{
-				instruction.i[count] = StringtoChar(data);
-				count++;
-			}
-		}
-                if(!gstricmp(dtype, "dw") && data[0]!=(char)NULL)
-		{
-			temp_int = StringtoInt(data);
-			memcpy(&instruction.i[count], &temp_int, 2);
-			count += 2;
-		}
-                if(!gstricmp(dtype, "dd") && data[0]!=(char)NULL)
-		{
-			temp_long = StringtoLong(data);
-			memcpy(&instruction.i[count], &temp_long, 4);
-			count+=4;
-		}
-		loop=0; firsttime = 0;
-		if(alldata[dataloop]==39)
-		{
-			loop=1; data[0] = 39; dataloop++;
-			for(;alldata[dataloop]!=(char)NULL && alldata[dataloop]!=39; dataloop++)
-			{
-				data[loop] = alldata[dataloop];
-				loop++;
-			}
-			data[loop] = 39;
-			loop++; dataloop++;
-			data[loop] = (char)NULL;
-			loop++;
-		}
-		else if(alldata[dataloop]==34)
-		{
-			loop=1; data[0] = 34; dataloop++;
-			for(;alldata[dataloop]!=(char)NULL && alldata[dataloop]!=34; dataloop++)
-			{
-				data[loop] = alldata[dataloop];
-				loop++;
-			}
-			data[loop]=34;
-			loop++; dataloop++;
-			data[loop]=(char)NULL;
-			loop++;
-		}
-		else
-		{
-			for(;alldata[dataloop]!=(char)NULL && alldata[dataloop]!=','; dataloop++)
-			{
-				data[loop] = alldata[dataloop];
-				loop++;
-			}
-			data[loop] = (char)NULL;
-			loop++;
-		}
-		for(; alldata[dataloop]!=',' && alldata[dataloop]!=(char)NULL; dataloop++);
-		if(alldata[dataloop]==',') dataloop++;
-                for(; (alldata[dataloop]==' ' || alldata[dataloop]=='\t') && alldata[dataloop]!=(char)(char)NULL; dataloop++);
-	}
-	instruction.length = count;
-
-	return instruction;
-}
-
-void Command(char *line)
-{
-	char *command, *parameters;
-
-	remstring(line, "["); remstring(line, "]");
-
-	command = strtok(line, " \n");
-	parameters = strtok((char)NULL, "\n");
-
-        if(!gstricmp(command, "ORG")) offset+=StringtoLong(parameters);
-        if(!gstricmp(command, "BITS"))
-	{
-		if(StringtoLong(parameters) == 16) BITS = 16;
-		else if(StringtoLong(parameters) == 32) BITS = 32;
-		else fatal_error("Invalid BITS operand, valid operands are 16 and 32 only");
-		
-	}
-}
-
-void Preprocessor(char *line)
-{
-	char *command, *parameters;
-	char filename_backup[255];
-	unsigned line_number_backup=0;
-
-	command = strtok(line, " \n");
-	parameters = strtok((char)NULL, "\n");
-
-        if(!gstricmp(command, "%include"))
-	{
-		remstring(parameters, "\"");
-		remstring(parameters, "\"");
-
-		line_number_backup = line_number;
-		line_number = 0;
-		strcpy(filename_backup, filename);
-		strcpy(filename, parameters);
-	
-		if(pass_number != 3) Parsefile(FALSE);
-		else Parsefile(TRUE);
-
-		line_number = line_number_backup;
-		strcpy(filename, filename_backup);
-	}
-}
-
-t_instruction popSeg(char *seg_reg)
-{
-	t_instruction instruction;
-
-	instruction.length = 0;
-	instruction.i = (unsigned char *)malloc(3);
-
-        if(!gstricmp(seg_reg, "ds"))
-	{
-                instruction.length = 1;
-		instruction.i[0] = 0x1F;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "es"))
-	{
-                instruction.length = 1;
-		instruction.i[0] = 0x07;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "ss"))
-	{
-                instruction.length = 1;
-		instruction.i[0] = 0x17;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "fs"))
-	{
-                instruction.length = 2;
-		instruction.i[0] = 0x0F;
-		instruction.i[1] = 0xA1;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "gs"))
-	{
-                instruction.length = 2;
-		instruction.i[0] = 0x0F;
-		instruction.i[1] = 0xA9;
-		return instruction;
-	}
-	
-	fatal_error("Invalid segment register, internal error");
-        return instruction;
-}
-t_instruction pushSeg(char *seg_reg)
-{
-	t_instruction instruction;
-
-	instruction.length = 0;
-	instruction.i = (unsigned char *)malloc(3);
-
-        if(!gstricmp(seg_reg, "cs"))
+	source = argv[argi];
+	if(argc - argi == 2)
 	{
-                instruction.length = 1;
-		instruction.i[0] = 0x0E;
-		return instruction;
+		if(strlen(argv[argi+1]) >= sizeof(outname)) { fprintf(stderr, "error: file name too long\n"); exit(1); }
+		strcpy(outname, argv[argi+1]);
 	}
-        if(!gstricmp(seg_reg, "ss"))
-	{
-                instruction.length = 1;
-		instruction.i[0] = 0x16;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "ds"))
-	{
-                instruction.length = 1;
-		instruction.i[0] = 0x1E;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "es"))
-	{
-                instruction.length = 1;
-		instruction.i[0] = 0x06;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "fs"))
-	{
-                instruction.length = 2;
-		instruction.i[0] = 0x0F;
-		instruction.i[1] = 0xA0;
-		return instruction;
-	}
-        if(!gstricmp(seg_reg, "gs"))
-	{
-                instruction.length = 2;
-		instruction.i[0] = 0x0F;
-		instruction.i[1] = 0xA8;
-		return instruction;
-	}
-	
-	fatal_error("Invalid segment register\n");
-        return instruction;
-}
-
-char isRelativeInstruction(char *instruction)
-{
-	int loop = 0;
-
-	for(loop=0; dynamic_lookup[loop].opcode_length!=0; loop++)
-                if(!gstricmp(instruction, dynamic_lookup[loop].instruction) && ((dynamic_lookup[loop].format & FORMAT_REL8) || (dynamic_lookup[loop].format & FORMAT_REL16) || (dynamic_lookup[loop].format & FORMAT_REL32))) return TRUE;
-	
-	return FALSE;
-}
-
-void HandleEQU(char *line)
-{
-	char *label=0, *value=0, *equ_cmd=0;
+	else OutputName(source, outname, sizeof(outname));
 
-	label = strtok(line, " \t\n");
-	equ_cmd = strtok((char)NULL, " \t\n");
-	value = strtok((char)NULL, "\n");
+	// Predefined labels (descriptor constants)
+	for(i = 0; i < sizeof(predefines) / sizeof(predefines[0]); i++) labels[label_count++] = predefines[i];
 
-	if(!equ_cmd || !value || !label)
-		fatal_error("Unable to split the line up into three parts, label, equ, value");
-
-        if(gstricmp(equ_cmd, "equ") && gstricmp(equ_cmd, "EQU"))
-		fatal_error("Internal error.. HandleEQU()\n");
-	
-        gstrlwr(label);
-
-	Addlabel(label, StringtoLong(value));
-}
-
-unsigned char FindRegister(char *reg)
-{
-	int loop=0;
-
-        for(loop=0; gstricmp(reg_lookup[loop].reg, ""); loop++)
-                if(!gstricmp(reg_lookup[loop].reg, reg)) return reg_lookup[loop].value;
-
-	fatal_error("Unable to find register, internal error");
-        return 0;
-}
-
-
-// remsting, removes a substring from a string
-// Thanks to intShredR for this one!
-int remstring(char *str, char *rem)
-{
-        char *n, *occurence=strstr(str, rem);
-                             
-        int rlen=strlen(rem);
-                               
-        if (!occurence) return 0;
-                                 
-        for (n=occurence+rlen; *n!='\0'; n++) *(n-rlen)=*n;
-        str[strlen(str)-rlen]='\0';
-                                         
-        return 1;
-}
-
-t_instruction Handletimes(char *line)
-{
-        char *timescommand, *number, *stuff;
-	t_instruction instruction, temp_instruction;
-	unsigned int loop=0, loop2=0;
-	
-	timescommand = strtok(line, " \t\n");
-	number = strtok((char)NULL, " \t\n");
-	stuff = strtok((char)NULL, "\n");
-
-	temp_instruction.length = 0;
-        if(!timescommand || !number || !stuff)
-                fatal_error("3 parameters not supplied");
-
-	temp_instruction = Parseline(stuff);
-
-	instruction.length = 0;
-      instruction.i = (unsigned char *)malloc((temp_instruction.length * StringtoLong(number)));
-
-	if(!instruction.i) {
-		printf("Unable to allocate %d bytes of memory\n", temp_instruction.length * StringtoLong(number));
-		fatal_error("Out of memory");
-	}
-
-	if(temp_instruction.length != 0)
+	// Assemble until every label address is stable, then do a final pass that writes the output
+	for(pass_number = 1; ; pass_number++)
 	{
-            for(loop=0; loop<StringtoLong(number); loop++)
-		{
-			for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-			instruction.length += temp_instruction.length;
-		}
+		if(pass_number > MAX_PASSES) { fprintf(stderr, "%s: error: label addresses did not converge after %d passes\n", source, MAX_PASSES); exit(1); }
+		RunPass(source);
+		if(pass_number > 1 && !labels_changed) break;
 	}
-
-	return instruction;
-}
-
-void fatal_error(char *error_msg)
-{
-	printf("%s:%d: %s\n", filename, line_number, error_msg);
-	exit(1);
-}
-
-
-t_instruction Handletss(char *line)
-{
-	char *label=0, *tss_cmd=0, tempstring[255];
-
-	label = strtok(line, " \t\n");
-	tss_cmd = strtok((char)NULL, "\n");
-
-	if(!tss_cmd || !label)
-		fatal_error("Unable to split the line up into two parts, label, tss");
-
-        if(gstricmp(tss_cmd, "tss"))
-		fatal_error("Internal error.. Handletss()\n");
-	
-        gstrlwr(label);
-	
-	Addlabel(label, offset);
-	sprintf(tempstring, "%s.back", label);
-	Addlabel(tempstring, offset);
-	sprintf(tempstring, "%s.esp0", label);
-	Addlabel(tempstring, offset+4);
-	sprintf(tempstring, "%s.ss0", label);
-	Addlabel(tempstring, offset+8);
-	sprintf(tempstring, "%s.esp1", label);
-	Addlabel(tempstring, offset+12);
-	sprintf(tempstring, "%s.ss1", label);
-	Addlabel(tempstring, offset+16);
-	sprintf(tempstring, "%s.esp2", label);
-	Addlabel(tempstring, offset+20);
-	sprintf(tempstring, "%s.ss2", label);
-	Addlabel(tempstring, offset+24);
-	sprintf(tempstring, "%s.cr3", label);
-	Addlabel(tempstring, offset+28);
-	sprintf(tempstring, "%s.eip", label);
-	Addlabel(tempstring, offset+32);
-	sprintf(tempstring, "%s.eflags", label);
-	Addlabel(tempstring, offset+36);
-	sprintf(tempstring, "%s.eax", label);
-	Addlabel(tempstring, offset+40);
-	sprintf(tempstring, "%s.ecx", label);
-	Addlabel(tempstring, offset+44);
-	sprintf(tempstring, "%s.edx", label);
-	Addlabel(tempstring, offset+48);
-	sprintf(tempstring, "%s.ebx", label);
-	Addlabel(tempstring, offset+52);
-	sprintf(tempstring, "%s.esp", label);
-	Addlabel(tempstring, offset+56);
-	sprintf(tempstring, "%s.ebp", label);
-	Addlabel(tempstring, offset+60);
-	sprintf(tempstring, "%s.esi", label);
-	Addlabel(tempstring, offset+64);
-	sprintf(tempstring, "%s.edi", label);
-	Addlabel(tempstring, offset+68);
-	sprintf(tempstring, "%s.es", label);
-	Addlabel(tempstring, offset+72);
-	sprintf(tempstring, "%s.cs", label);
-	Addlabel(tempstring, offset+76);
-	sprintf(tempstring, "%s.ss", label);
-	Addlabel(tempstring, offset+80);
-	sprintf(tempstring, "%s.ds", label);
-	Addlabel(tempstring, offset+84);
-	sprintf(tempstring, "%s.fs", label);
-	Addlabel(tempstring, offset+88);
-	sprintf(tempstring, "%s.gs", label);
-	Addlabel(tempstring, offset+92);
-	sprintf(tempstring, "%s.ldt", label);
-	Addlabel(tempstring, offset+96);
-	sprintf(tempstring, "%s.trap", label);
-	Addlabel(tempstring, offset+100);
-	sprintf(tempstring, "%s.io", label);
-	Addlabel(tempstring, offset+102);
-
-	strcpy(tempstring, "times 104 db 0");
-
-      return Parseline(tempstring);
-}
-
-int gstricmp(char *string1, char *string2)
-{
-	int loop=0;
-	
-	if(!string1 || !string2) return 1;
-
-	while(*string1 && *string2)
-	if(tolower(*(string1++)) != tolower(*(string2++))) return 1;
-
-	if(tolower(*(string1++)) != tolower(*(string2++))) return 1;
+	pass_number++;
+	final_pass = TRUE;
+	RunPass(source);
+	if(labels_changed) { fprintf(stderr, "%s: error: label addresses changed during the final pass\n", source); exit(1); }
 
+	if((out = fopen(outname, "wb")) == NULL) { perror(outname); exit(1); }
+	if(outlen && fwrite(outbuf, 1, outlen, out) != outlen) { perror(outname); exit(1); }
+	if(fclose(out) != 0) { perror(outname); exit(1); }
+	free(outbuf);
 	return 0;
-}
-
-int gstrnicmp(char *string1, char *string2, unsigned int n)
-{
-	int loop=0;
-
-	if(!string1 || !string2) return 1;	
-
-	for(loop=0; loop<n; loop++)
-		if(tolower(*string1++) != tolower(*string2++)) return 1;
-	return 0;
-}
-
-void gstrlwr(char *string)
-{
-	if(!string) return;
-	while(string[0]) { string[0] = tolower(string[0]); string++;} 
-}
- 
-t_instruction Handledesc(char *line)
-{
-      char *desccommand=0, *stuff=0, *dparm1=0, *dparm2=0, *dparm3=0, tempstring[255];
-	unsigned long vdparm1=0, vdparm2=0, vdparm3=0;
-	t_instruction instruction, temp_instruction;
-	unsigned int loop=0, loop2=0;
-	
-	desccommand = strtok(line, " \t\n");
-	stuff = strtok((char)NULL, "\n");
-
-	dparm1 = strtok(stuff, ",");
-	dparm2 = strtok(NULL, ",");	
-	dparm3 = strtok(NULL, "\n");
-
-	temp_instruction.length = 0;
-        if(!desccommand || !stuff || !dparm1 || !dparm2 || !dparm3)
-                fatal_error("Invalid format");
-
-	
-	vdparm1 = StringtoLong(dparm1);
-	vdparm2 = StringtoLong(dparm2);
-	vdparm3 = StringtoLong(dparm3);
-
-	instruction.length = 0;
-      instruction.i = (unsigned char *)malloc(10);
-
-	if(!instruction.i)
-		fatal_error("Out of memory");
-
-
-	if(vdparm3 & ((~vdparm3)>>2) & 0x400)
-	{
-		sprintf(tempstring, "dw %d", vdparm1);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-		sprintf(tempstring, "dw %d", vdparm2);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-		sprintf(tempstring, "dw %d", vdparm3 + 0x8000);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-		sprintf(tempstring, "dw %d", vdparm1 >> 16);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-	}
-	else
-	{
-		sprintf(tempstring, "dw %d", vdparm2);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-	
-		sprintf(tempstring, "dw %d", vdparm1);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-		sprintf(tempstring, "db %d", vdparm1 >> 16);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-		sprintf(tempstring, "db %d", (vdparm3 + 0x8000) >> 8);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-		sprintf(tempstring, "db %d", vdparm3 + (vdparm2 >> 16));
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-		sprintf(tempstring, "db %d", vdparm1 >> 24);
-		temp_instruction = Parseline(tempstring);
-		for(loop2=instruction.length; loop2<(instruction.length+temp_instruction.length); loop2++) instruction.i[loop2] = temp_instruction.i[loop2-instruction.length];
-		instruction.length += temp_instruction.length;
-
-	}
-	return instruction;
-}
-
-char isHex(char *string)
-{
-	char tempstring[255];
-	unsigned int loop=0;
-
-	if(!string) return FALSE;
-	
-	strcpy(tempstring, string);
-
-	if(!gstrnicmp(tempstring, "0x", 2)) { remstring(tempstring, "0x"); remstring(tempstring, "0X"); }
-	if(tempstring[strlen(tempstring)-1] == 'h') tempstring[strlen(tempstring)-1] = '\0';
-
-	for(loop=0; tempstring[loop]!='\0'; loop++)
-		if(tempstring[loop]>'F' || tempstring[loop]<'A' || tempstring[loop]>'f' || tempstring[loop]<'a' || tempstring[loop]>'9' || tempstring[loop]<'0') return FALSE;
-
-	return TRUE;
 }
