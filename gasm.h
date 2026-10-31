@@ -1,11 +1,11 @@
-// GASM Source Code, Gareth Owen, gaz@athene.co.uk, http://gasm.cjb.net
+// GASM Source Code, Gareth Owenson
 // YOU MUST READ LICENSE.TXT BEFORE USE OF THE SOURCE CODE IS PERMITTED, 
 // IF YOU DO NOT HAVE LICENSE.TXT THEN EITHER GET A COPY OF 
 // DELETE THIS SOURCE CODE
 
 /*
 GASM Assembler
-Copyright (C) 1999  Gareth Owen <gaz@athene.co.uk>
+Copyright (C) 1999  Gareth Owenson
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -79,155 +79,33 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define FORMAT_REL32		8
 #define FORMAT_REGPLUSOP	16
 
-#define MODRM_FORMAT_AX		1L	// AX, EAX, AL, MM0
-#define MODRM_FORMAT_BX		2L	// BX, EBX, BL, MM3
-#define MODRM_FORMAT_CX		4L	// ECX, CX, CL, MM1
-#define MODRM_FORMAT_DX		8L	// EDX, DX, DL, MM2
-#define MODRM_FORMAT_SI		16L	// ESI, SI, DH, MM6
-#define MODRM_FORMAT_DI		32L	// EDI, DI, BH, MM7
-#define MODRM_FORMAT_BP		64L	// EBP, BP, CH, MM5
-#define MODRM_FORMAT_SP		128L	// ESP, SP, AH, MM4
-#define MODRM_FORMAT_DISP8	256L	// 8bit Displacement
-#define MODRM_FORMAT_DISP16	512L	// 16bit Displacement
-#define MODRM_FORMAT_INBRACK	1024L	// memory location (ie, in brackets)
-
-#define MODRM_FORMAT_EAX	2048L
-#define MODRM_FORMAT_EBX	4096L
-#define MODRM_FORMAT_ECX	8192L
-#define MODRM_FORMAT_EDX	16384L
-#define MODRM_FORMAT_ESI	32768L
-#define MODRM_FORMAT_EDI	65536L
-#define MODRM_FORMAT_EBP	131072L
-#define MODRM_FORMAT_ESP	262144L
-#define MODRM_FORMAT_DISP32	524288L
 
 
-#define SIZE_CORRECT_NONE	0
-#define SIZE_CORRECT_BYTE	1
-#define SIZE_CORRECT_WORD	2
 
+
+#define LABEL_NAME_MAX	128
+#define MAX_LABELS	65536
 
 typedef struct
 {
-	char l_name[40];
-	long m_offset;
+	char l_name[LABEL_NAME_MAX];
+	long long m_offset;
 	char active;
-	unsigned char pass_number;
+	int pass_number;	// pass in which the label was last defined (0 = predefined)
 } t_label;
 
-#define MAX_LABELS 500
-t_label labels[MAX_LABELS];
+
+
+
 
 typedef struct
 {
-	unsigned int length;
-	unsigned char *i;
-} t_instruction;
-
-typedef struct
-{
-	unsigned char modrm_byte;	// modrm byte, duh.. :-)
-	unsigned long format;		// uses MODRM_FORMAT defines
-} t_modrm;
-
-typedef struct
-{
-	unsigned char value;
-	char reg[4];
-} t_reg_lookup;
-
-t_reg_lookup reg_lookup[] = {
-	{0, "al"}, {1, "cl"}, {2, "dl"}, {3, "bl"}, {4, "ah"}, {5, "ch"}, {6, "dh"}, {7, "bh"},
-	{0, "ax"}, {1, "cx"}, {2, "dx"}, {3, "bx"}, {4, "sp"}, {5, "bp"}, {6, "si"}, {7, "di"},
-	{0, "eax"}, {1, "ecx"}, {2, "edx"}, {3, "ebx"}, {4, "esp"}, {5, "ebp"}, {6, "esi"}, {7, "edi"},
-	{0, ""}
-};
-
-t_modrm modrm_lookup[] = {
-	{0x00, MODRM_FORMAT_BX + MODRM_FORMAT_SI + MODRM_FORMAT_INBRACK},	// [BX][SI]
-	{0x01, MODRM_FORMAT_BX + MODRM_FORMAT_DI + MODRM_FORMAT_INBRACK},	// [BX][DI]
-	{0x02, MODRM_FORMAT_BP + MODRM_FORMAT_SI + MODRM_FORMAT_INBRACK},	// [BP][SI]
-	{0x03, MODRM_FORMAT_BP + MODRM_FORMAT_DI + MODRM_FORMAT_INBRACK},	// [BP][DI]
-	{0x04, MODRM_FORMAT_SI + MODRM_FORMAT_INBRACK},		// [SI]
-	{0x05, MODRM_FORMAT_DI + MODRM_FORMAT_INBRACK},		// [DI]
-	{0x06, MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK},	// [0x0000]
-	{0x07, MODRM_FORMAT_BX + MODRM_FORMAT_INBRACK},		// [BX]
-
-	{0x40, MODRM_FORMAT_BX + MODRM_FORMAT_SI + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [BX][SI][0x00]
-	{0x41, MODRM_FORMAT_BX + MODRM_FORMAT_DI + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [BX][DI][0x00]
-	{0x42, MODRM_FORMAT_BP + MODRM_FORMAT_SI + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [BP][SI][0x00]
-	{0x43, MODRM_FORMAT_BP + MODRM_FORMAT_DI + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [BP][DI][0x00]
-	{0x44, MODRM_FORMAT_SI + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [SI][0x00]
-	{0x45, MODRM_FORMAT_DI + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [DI][0x00]
-	{0x46, MODRM_FORMAT_BP + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [BP][0x00]
-	{0x47, MODRM_FORMAT_BX + MODRM_FORMAT_DISP8 + MODRM_FORMAT_INBRACK},	// [BX][0x00]
-
-	{0x80, MODRM_FORMAT_BX + MODRM_FORMAT_SI + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK},	// [BX][SI][0x0000]
-	{0x81, MODRM_FORMAT_BX + MODRM_FORMAT_DI + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK}, // [BX][DI][0x0000]
-	{0x82, MODRM_FORMAT_BP + MODRM_FORMAT_SI + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK}, // [BP][SI][0x0000]
-	{0x83, MODRM_FORMAT_BP + MODRM_FORMAT_DI + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK}, // [BP][DI][0x0000]
-	{0x84, MODRM_FORMAT_SI + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK},	// [SI][0x0000]
-	{0x85, MODRM_FORMAT_DI + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK},	// [DI][0x0000]
-	{0x86, MODRM_FORMAT_BP + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK},	// [BP][0x0000]
-	{0x87, MODRM_FORMAT_BX + MODRM_FORMAT_DISP16 + MODRM_FORMAT_INBRACK},	// [BX][0x0000]
-
-	{0x40, MODRM_FORMAT_BX + MODRM_FORMAT_SI + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [BX][SI][0x00]
-	{0x41, MODRM_FORMAT_BX + MODRM_FORMAT_DI + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [BX][DI][0x00]
-	{0x42, MODRM_FORMAT_BP + MODRM_FORMAT_SI + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [BP][SI][0x00]
-	{0x43, MODRM_FORMAT_BP + MODRM_FORMAT_DI + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [BP][DI][0x00]
-	{0x44, MODRM_FORMAT_SI + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [SI][0x00]
-	{0x45, MODRM_FORMAT_DI + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [DI][0x00]
-	{0x46, MODRM_FORMAT_BP + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [BP][0x00]
-	{0x47, MODRM_FORMAT_BX + MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},	// [BX][0x00]
-
-	{0xC0, MODRM_FORMAT_AX},	// AX, AL
-	{0xC1, MODRM_FORMAT_CX},	// CX, CL
-	{0xC2, MODRM_FORMAT_DX},	// DX, DL
-	{0xC3, MODRM_FORMAT_BX},	// BX, BL
-	{0xC4, MODRM_FORMAT_SP},	// SP, AH
-	{0xC5, MODRM_FORMAT_BP},	// BP, CH
-	{0xC6, MODRM_FORMAT_SI},	// SI, DH
-	{0xC7, MODRM_FORMAT_DI},	// DI, BH
-	
-
-// <-> <-> 32bit - MODRM32 <-> <->
-	
-	{0x00, MODRM_FORMAT_EAX + MODRM_FORMAT_INBRACK},		// [EAX]
-	{0x01, MODRM_FORMAT_ECX + MODRM_FORMAT_INBRACK},		// [ECX]
-	{0x02, MODRM_FORMAT_EDX + MODRM_FORMAT_INBRACK},		// [EDX]
-	{0x03, MODRM_FORMAT_EBX + MODRM_FORMAT_INBRACK},		// [EBX]
-	{0x05, MODRM_FORMAT_DISP32 + MODRM_FORMAT_INBRACK},		// [0x00000000]
-	{0x06, MODRM_FORMAT_ESI + MODRM_FORMAT_INBRACK},		// [ESI]
-	{0x07, MODRM_FORMAT_EDI + MODRM_FORMAT_INBRACK},		// [EDI]
-
-	{0x40, MODRM_FORMAT_DISP8 + MODRM_FORMAT_EAX + MODRM_FORMAT_INBRACK},	// [0x00][EAX]
-	{0x41, MODRM_FORMAT_DISP8 + MODRM_FORMAT_ECX + MODRM_FORMAT_INBRACK},	// [0x00][ECX]
-	{0x42, MODRM_FORMAT_DISP8 + MODRM_FORMAT_EDX + MODRM_FORMAT_INBRACK},	// [0x00][EDX]
-	{0x43, MODRM_FORMAT_DISP8 + MODRM_FORMAT_EBX + MODRM_FORMAT_INBRACK},	// [0x00][EBX]
-	{0x45, MODRM_FORMAT_DISP8 + MODRM_FORMAT_EBP + MODRM_FORMAT_INBRACK},	// [0x00][EBP]
-	{0x46, MODRM_FORMAT_DISP8 + MODRM_FORMAT_ESI + MODRM_FORMAT_INBRACK},	// [0x00][ESI]
-	{0x47, MODRM_FORMAT_DISP8 + MODRM_FORMAT_EDI + MODRM_FORMAT_INBRACK},	// [0x00][EDI]
-
-	{0xC0, MODRM_FORMAT_EAX},
-	{0xC1, MODRM_FORMAT_ECX},
-	{0xC2, MODRM_FORMAT_EDX},
-	{0xC3, MODRM_FORMAT_EBX},
-	{0xC4, MODRM_FORMAT_ESP},
-	{0xC5, MODRM_FORMAT_EBP},
-	{0xC6, MODRM_FORMAT_ESI},
-	{0xC7, MODRM_FORMAT_EDI},
-	
-	{0x00, 0x00}	// Terminator
-};
-
-typedef struct
-{
-	char c1;
-	char c2;
-	char c3;
+	unsigned char c1;
+	unsigned char c2;
+	unsigned char c3;
 	char length;
 	char i_name[20];
-	char bits;
+	char bits;	// operand size the instruction implies: 0 = none, 16 or 32 (adds 0x66 when it differs from BITS)
 } t_fixed_instruction;
 
 typedef struct
@@ -241,77 +119,72 @@ typedef struct
 } t_dynamic_instruction;
 
 
-unsigned int Evaluator(char *e_string);
-void Addlabel(char *label_name, long offset);
-t_label Findlabel(char *label_name);
-unsigned char StringtoChar(char *string);
-unsigned int  StringtoInt(char *string);
-unsigned long StringtoLong(char *string);
 
 t_fixed_instruction fixed_instruction_lookup[] = {
-	{0x37, 0x00, 0x00, 1, "aaa", 16},		{0xD5, 0x0A, 0x00, 2, "aad", 16},
-	{0xD4, 0x0A, 0x00, 2, "aam", 16},		{0x3F, 0x00, 0x00, 1, "aas", 16},
+	{0x37, 0x00, 0x00, 1, "aaa", 0},		{0xD5, 0x0A, 0x00, 2, "aad", 0},
+	{0xD4, 0x0A, 0x00, 2, "aam", 0},		{0x3F, 0x00, 0x00, 1, "aas", 0},
 	{0x98, 0x00, 0x00, 1, "cbw", 16},		{0x98, 0x00, 0x00, 1, "cwde", 32},
-	{0xF8, 0x00, 0x00, 1, "clc", 16},		{0xFC, 0x00, 0x00, 1, "cld", 16},
-	{0xFA, 0x00, 0x00, 1, "cli", 16},		{0x0F, 0x06, 0x00, 2, "clts", 16},
-	{0xF5, 0x00, 0x00, 1, "cmc", 16},		{0xA6, 0x00, 0x00, 1, "cmpsb", 16},
+	{0xF8, 0x00, 0x00, 1, "clc", 0},		{0xFC, 0x00, 0x00, 1, "cld", 0},
+	{0xFA, 0x00, 0x00, 1, "cli", 0},		{0x0F, 0x06, 0x00, 2, "clts", 0},
+	{0xF5, 0x00, 0x00, 1, "cmc", 0},		{0xA6, 0x00, 0x00, 1, "cmpsb", 0},
 	{0xA7, 0x00, 0x00, 1, "cmpsw", 16},		{0xA7, 0x00, 0x00, 1, "cmpsd", 32},
-	{0x0F, 0xA2, 0x00, 2, "cpuid", 16},  	{0x99, 0x00, 0x00, 1, "cwd", 16},		
-	{0x99, 0x00, 0x00, 1, "cdq", 32},		{0x27, 0x00, 0x00, 1, "daa", 16},		
-	{0x2F, 0x00, 0x00, 1, "das", 16},		{0x0F, 0x77, 0x00, 2, "emms", 16},		
-	{0xD9, 0xF0, 0x00, 2, "f2xm1", 16},		{0xD9, 0xE1, 0x00, 2, "fabs", 16},		
-	{0xDE, 0xC1, 0x00, 2, "faddp", 16},		{0xD9, 0xE0, 0x00, 2, "fchs", 16},		
-	{0x9B, 0xDB, 0xE2, 3, "fclex", 16},		{0xDB, 0xE2, 0x00, 2, "fnclex", 16},	
-	{0xD8, 0xD1, 0x00, 2, "fcom", 16},		{0xD8, 0xD9, 0x00, 2, "fcomp", 16},		
-	{0xDE, 0xD9, 0x00, 2, "fcompp", 16},	{0xD9, 0xFF, 0x00, 2, "fcos", 16},		
-	{0xD9, 0xF6, 0x00, 2, "fdecstp", 16},	{0xDE, 0xF9, 0x00, 2, "fdivp", 16},		
-	{0xDE, 0xF1, 0x00, 2, "fdivrp", 16},	{0xD9, 0xF7, 0x00, 2, "fincstp", 16},	
-	{0x9B, 0xDB, 0xE3, 3, "finit", 16},		{0xDB, 0xE3, 0x00, 2, "fninit", 16},	
-	{0xD9, 0xE8, 0x00, 2, "fld1", 16},		{0xD9, 0xE9, 0x00, 2, "fldl2t", 16},	
-	{0xD9, 0xEA, 0x00, 2, "fldl2e", 16},	{0xD9, 0xEB, 0x00, 2, "fldpi", 16}, 	
-	{0xD9, 0xEC, 0x00, 2, "fldlg2", 16},	{0xD9, 0xED, 0x00, 2, "fldln2", 16},	
-	{0xD9, 0xEE, 0x00, 2, "fldz", 16},		{0xDE, 0xC9, 0x00, 2, "fmulp", 16}, 	
-	{0xD9, 0xD0, 0x00, 2, "fnop", 16},		{0xD9, 0xF3, 0x00, 2, "fpatan", 16},	
-	{0xD9, 0xF8, 0x00, 2, "fprem", 16},		{0xD9, 0xF5, 0x00, 2, "fprem1", 16},	
-	{0xD9, 0xF2, 0x00, 2, "fptan", 16},		{0xD9, 0xFC, 0x00, 2, "frndint", 16},	
-	{0xD9, 0xFD, 0x00, 2, "fscale", 16},	{0xD9, 0xFE, 0x00, 2, "fsin", 16},		
-	{0xD9, 0xFB, 0x00, 2, "fsincos", 16},	{0xD9, 0xFA, 0x00, 2, "fsqrt", 16},		
-	{0xDE, 0xE9, 0x00, 2, "fsubp", 16},		{0xDE, 0xE1, 0x00, 2, "fsubrp", 16},	
-	{0xD9, 0xE4, 0x00, 2, "ftst", 16},		{0xDD, 0xE1, 0x00, 2, "fucom", 16},		
-	{0xDD, 0xE9, 0x00, 2, "fucomp", 16},	{0xD9, 0xE5, 0x00, 2, "fxam", 16},		
-	{0xD9, 0xC9, 0x00, 2, "fxch", 16},		{0xD9, 0xF4, 0x00, 2, "fxtract", 16},	
-	{0xD9, 0xF1, 0x00, 2, "fyl2x", 16},		{0xD9, 0xF9, 0x00, 2, "fyl2xp1", 16},	
-	{0xF4, 0x00, 0x00, 1, "hlt", 16},		{0x6C, 0x00, 0x00, 1, "insb", 16},		
+	{0x0F, 0xA2, 0x00, 2, "cpuid", 0},  	{0x99, 0x00, 0x00, 1, "cwd", 16},		
+	{0x99, 0x00, 0x00, 1, "cdq", 32},		{0x27, 0x00, 0x00, 1, "daa", 0},		
+	{0x2F, 0x00, 0x00, 1, "das", 0},		{0x0F, 0x77, 0x00, 2, "emms", 0},		
+	{0xD9, 0xF0, 0x00, 2, "f2xm1", 0},		{0xD9, 0xE1, 0x00, 2, "fabs", 0},		
+	{0xDE, 0xC1, 0x00, 2, "faddp", 0},		{0xD9, 0xE0, 0x00, 2, "fchs", 0},		
+	{0x9B, 0xDB, 0xE2, 3, "fclex", 0},		{0xDB, 0xE2, 0x00, 2, "fnclex", 0},	
+	{0xD8, 0xD1, 0x00, 2, "fcom", 0},		{0xD8, 0xD9, 0x00, 2, "fcomp", 0},		
+	{0xDE, 0xD9, 0x00, 2, "fcompp", 0},	{0xD9, 0xFF, 0x00, 2, "fcos", 0},		
+	{0xD9, 0xF6, 0x00, 2, "fdecstp", 0},	{0xDE, 0xF9, 0x00, 2, "fdivp", 0},		
+	{0xDE, 0xF1, 0x00, 2, "fdivrp", 0},	{0xD9, 0xF7, 0x00, 2, "fincstp", 0},	
+	{0x9B, 0xDB, 0xE3, 3, "finit", 0},		{0xDB, 0xE3, 0x00, 2, "fninit", 0},	
+	{0xD9, 0xE8, 0x00, 2, "fld1", 0},		{0xD9, 0xE9, 0x00, 2, "fldl2t", 0},	
+	{0xD9, 0xEA, 0x00, 2, "fldl2e", 0},	{0xD9, 0xEB, 0x00, 2, "fldpi", 0}, 	
+	{0xD9, 0xEC, 0x00, 2, "fldlg2", 0},	{0xD9, 0xED, 0x00, 2, "fldln2", 0},	
+	{0xD9, 0xEE, 0x00, 2, "fldz", 0},		{0xDE, 0xC9, 0x00, 2, "fmulp", 0}, 	
+	{0xD9, 0xD0, 0x00, 2, "fnop", 0},		{0xD9, 0xF3, 0x00, 2, "fpatan", 0},	
+	{0xD9, 0xF8, 0x00, 2, "fprem", 0},		{0xD9, 0xF5, 0x00, 2, "fprem1", 0},	
+	{0xD9, 0xF2, 0x00, 2, "fptan", 0},		{0xD9, 0xFC, 0x00, 2, "frndint", 0},	
+	{0xD9, 0xFD, 0x00, 2, "fscale", 0},	{0xD9, 0xFE, 0x00, 2, "fsin", 0},		
+	{0xD9, 0xFB, 0x00, 2, "fsincos", 0},	{0xD9, 0xFA, 0x00, 2, "fsqrt", 0},		
+	{0xDE, 0xE9, 0x00, 2, "fsubp", 0},		{0xDE, 0xE1, 0x00, 2, "fsubrp", 0},	
+	{0xD9, 0xE4, 0x00, 2, "ftst", 0},		{0xDD, 0xE1, 0x00, 2, "fucom", 0},		
+	{0xDD, 0xE9, 0x00, 2, "fucomp", 0},	{0xD9, 0xE5, 0x00, 2, "fxam", 0},		
+	{0xD9, 0xC9, 0x00, 2, "fxch", 0},		{0xD9, 0xF4, 0x00, 2, "fxtract", 0},	
+	{0xD9, 0xF1, 0x00, 2, "fyl2x", 0},		{0xD9, 0xF9, 0x00, 2, "fyl2xp1", 0},	
+	{0xF4, 0x00, 0x00, 1, "hlt", 0},		{0x6C, 0x00, 0x00, 1, "insb", 0},		
 	{0x6D, 0x00, 0x00, 1, "insw", 16},		{0x6D, 0x00, 0x00, 1, "insd", 32},		
-	{0xCE, 0x00, 0x00, 1, "into", 16},		{0x0F, 0x08, 0x00, 2, "invd", 16},		
-	{0xCF, 0x00, 0x00, 1, "iret", 16},		{0xCF, 0x00, 0x00, 1, "iretd", 32},		
-	{0x9F, 0x00, 0x00, 1, "lahf", 16},		{0xC9, 0x00, 0x00, 1, "leave", 16},		
-	{0xAC, 0x00, 0x00, 1, "lodsb", 16},		{0xF0, 0x00, 0x00, 1, "lock", 16},
+	{0xCE, 0x00, 0x00, 1, "into", 0},		{0x0F, 0x08, 0x00, 2, "invd", 0},		
+	{0xCF, 0x00, 0x00, 1, "iret", 0},		{0xCF, 0x00, 0x00, 1, "iretd", 32},		
+	{0x9F, 0x00, 0x00, 1, "lahf", 0},		{0xC9, 0x00, 0x00, 1, "leave", 0},		
+	{0xAC, 0x00, 0x00, 1, "lodsb", 0},		{0xF0, 0x00, 0x00, 1, "lock", 0},
 	{0xAD, 0x00, 0x00, 1, "lodsw", 16},		{0xAD, 0x00, 0x00, 1, "lodsd", 32},		
-	{0xA4, 0x00, 0x00, 1, "movsb", 16},		{0xA5, 0x00, 0x00, 1, "movsw", 16},		
-	{0xA5, 0x00, 0x00, 1, "movsd", 32},		{0x90, 0x00, 0x00, 1, "nop", 16},		
-	{0x6E, 0x00, 0x00, 1, "outsb", 16},		{0x6f, 0x00, 0x00, 1, "outsw", 16},		
-	{0x6F, 0x00, 0x00, 1, "outsd", 32},		{0x61, 0x00, 0x00, 1, "popa", 16},		
-	{0x61, 0x00, 0x00, 1, "popad", 32},		{0x9D, 0x00, 0x00, 1, "popf", 16},		
-	{0x9D, 0x00, 0x00, 1, "popfd", 32},		{0x60, 0x00, 0x00, 1, "pusha", 16},		
-	{0x60, 0x00, 0x00, 1, "pushad", 32},	{0x9C, 0x00, 0x00, 1, "pushf", 16},		
-	{0x9C, 0x00, 0x00, 1, "pushfd", 32},	{0x0F, 0x32, 0x00, 2, "rdmsr", 16},
-	{0xF2, 0x00, 0x00, 1, "repne", 16},	{0xF2, 0x00, 0x00, 1, "repnz", 16},		
-	{0xF3, 0x00, 0x00, 1, "rep", 16},		{0xF3, 0x00, 0x00, 1, "repe", 16},
-	{0xF3, 0x00, 0x00, 1, "repz", 16},
-	{0x0F, 0x33, 0x00, 2, "rdpmc", 16},		{0x0F, 0x31, 0x00, 2, "rdtsc", 16},		
-	{0xC3, 0x00, 0x00, 1, "ret", 16},		{0xCB, 0x00, 0x00, 1, "retf", 16},		
-	{0x0F, 0xAA, 0x00, 2, "rsm", 16},		{0x9E, 0x00, 0x00, 1, "sahf", 16},		
-	{0xAE, 0x00, 0x00, 1, "scasb", 16},		{0xAF, 0x00, 0x00, 1, "scasw", 16},		
-	{0xAF, 0x00, 0x00, 1, "scasd", 32},		{0xF9, 0x00, 0x00, 1, "stc", 16},		
-	{0xFD, 0x00, 0x00, 1, "std", 16},		{0xFB, 0x00, 0x00, 1, "sti", 16},		
-	{0xAA, 0x00, 0x00, 1, "stosb", 16},		{0xAB, 0x00, 0x00, 1, "stosw", 16},		
-	{0xAB, 0x00, 0x00, 1, "stosd", 32},		{0x0F, 0x0B, 0x00, 2, "ud2", 16},		
-	{0x9B, 0x00, 0x00, 1, "wait", 16},		{0x9B, 0x00, 0x00, 1, "fwait", 32},		
-	{0x0F, 0x09, 0x00, 2, "wbinvd", 16},	{0x0F, 0x30, 0x00, 2, "wrmsr", 16},		
-	{0xD7, 0x00, 0x00, 1, "xlat", 16}, 		
+	{0xA4, 0x00, 0x00, 1, "movsb", 0},		{0xA5, 0x00, 0x00, 1, "movsw", 16},		
+	{0xA5, 0x00, 0x00, 1, "movsd", 32},		{0x90, 0x00, 0x00, 1, "nop", 0},		
+	{0x6E, 0x00, 0x00, 1, "outsb", 0},		{0x6f, 0x00, 0x00, 1, "outsw", 16},		
+	{0x6F, 0x00, 0x00, 1, "outsd", 32},		{0x61, 0x00, 0x00, 1, "popa", 0},		
+	{0x61, 0x00, 0x00, 1, "popad", 32},		{0x9D, 0x00, 0x00, 1, "popf", 0},		
+	{0x9D, 0x00, 0x00, 1, "popfd", 32},		{0x60, 0x00, 0x00, 1, "pusha", 0},		
+	{0x60, 0x00, 0x00, 1, "pushad", 32},	{0x9C, 0x00, 0x00, 1, "pushf", 0},		
+	{0x9C, 0x00, 0x00, 1, "pushfd", 32},	{0x0F, 0x32, 0x00, 2, "rdmsr", 0},
+	{0xF2, 0x00, 0x00, 1, "repne", 0},	{0xF2, 0x00, 0x00, 1, "repnz", 0},		
+	{0xF3, 0x00, 0x00, 1, "rep", 0},		{0xF3, 0x00, 0x00, 1, "repe", 0},
+	{0xF3, 0x00, 0x00, 1, "repz", 0},
+	{0x0F, 0x33, 0x00, 2, "rdpmc", 0},		{0x0F, 0x31, 0x00, 2, "rdtsc", 0},		
+	{0xC3, 0x00, 0x00, 1, "ret", 0},		{0xCB, 0x00, 0x00, 1, "retf", 0},		
+	{0x0F, 0xAA, 0x00, 2, "rsm", 0},		{0x9E, 0x00, 0x00, 1, "sahf", 0},		
+	{0xAE, 0x00, 0x00, 1, "scasb", 0},		{0xAF, 0x00, 0x00, 1, "scasw", 16},		
+	{0xAF, 0x00, 0x00, 1, "scasd", 32},		{0xF9, 0x00, 0x00, 1, "stc", 0},		
+	{0xFD, 0x00, 0x00, 1, "std", 0},		{0xFB, 0x00, 0x00, 1, "sti", 0},		
+	{0xAA, 0x00, 0x00, 1, "stosb", 0},		{0xAB, 0x00, 0x00, 1, "stosw", 16},		
+	{0xAB, 0x00, 0x00, 1, "stosd", 32},		{0x0F, 0x0B, 0x00, 2, "ud2", 0},		
+	{0x9B, 0x00, 0x00, 1, "wait", 0},		{0x9B, 0x00, 0x00, 1, "fwait", 0},		
+	{0x0F, 0x09, 0x00, 2, "wbinvd", 0},	{0x0F, 0x30, 0x00, 2, "wrmsr", 0},		
+	{0xD7, 0x00, 0x00, 1, "xlat", 0}, 		{0xD7, 0x00, 0x00, 1, "xlatb", 0},
+	{0xCC, 0x00, 0x00, 1, "int3", 0},
 
-	{0x00, 0x00, 0x00, 0, ""}	// Terminator
+	{0x00, 0x00, 0x00, 0, "", 0}	// Terminator
 };
 
 t_dynamic_instruction dynamic_lookup[] = {
@@ -474,7 +347,7 @@ t_dynamic_instruction dynamic_lookup[] = {
 	{0x38, 0x00, 0x00, 1, MODRM_OPCODE_0, EVALUATE_REGM8, EVALUATE_REG8, FORMAT_MODRM, "cmp"},
 	{0x39, 0x00, 0x00, 1, MODRM_OPCODE_0, EVALUATE_REGM16, EVALUATE_REG16, FORMAT_MODRM, "cmp"},
 	{0x39, 0x00, 0x00, 1, MODRM_OPCODE_0, EVALUATE_REGM32, EVALUATE_REG32, FORMAT_MODRM, "cmp"},
-	{0x3A, 0x00, 0x00, 1, MODRM_OPCODE_0, EVALUATE_REG8, EVALUATE_REGM16, FORMAT_MODRM, "cmp"},
+	{0x3A, 0x00, 0x00, 1, MODRM_OPCODE_0, EVALUATE_REG8, EVALUATE_REGM8, FORMAT_MODRM, "cmp"},
 	{0x3B, 0x00, 0x00, 1, MODRM_OPCODE_0, EVALUATE_REG16, EVALUATE_REGM16, FORMAT_MODRM, "cmp"},
 	{0x3B, 0x00, 0x00, 1, MODRM_OPCODE_0, EVALUATE_REG32, EVALUATE_REGM32, FORMAT_MODRM, "cmp"},
 
@@ -685,7 +558,7 @@ t_dynamic_instruction dynamic_lookup[] = {
 
 	{0x0F, 0xBE, 0x00, 2, MODRM_OPCODE_0, EVALUATE_REG16, EVALUATE_REGM8, FORMAT_MODRM, "movsx"},
 	{0x0F, 0xBE, 0x00, 2, MODRM_OPCODE_0, EVALUATE_REG32, EVALUATE_REGM8, FORMAT_MODRM, "movsx"},
-	{0x0F, 0xBE, 0x00, 2, MODRM_OPCODE_0, EVALUATE_REG32, EVALUATE_REGM16, FORMAT_MODRM, "movsx"},
+	{0x0F, 0xBF, 0x00, 2, MODRM_OPCODE_0, EVALUATE_REG32, EVALUATE_REGM16, FORMAT_MODRM, "movsx"},
 	
 	{0x0F, 0xB6, 0x00, 2, MODRM_OPCODE_0, EVALUATE_REG16, EVALUATE_REGM8, FORMAT_MODRM, "movzx"},
 	{0x0F, 0xB6, 0x00, 2, MODRM_OPCODE_0, EVALUATE_REG32, EVALUATE_REGM8, FORMAT_MODRM, "movzx"},
@@ -920,27 +793,27 @@ t_dynamic_instruction dynamic_lookup[] = {
 
 t_label predefines[] = {
 
-	{"D_LDT", 0x200, TRUE, 1},
-	{"D_TASK", 0x500, TRUE, 1},
-	{"D_TSS", 0x900, TRUE, 1},
-	{"D_CALL", 0x0C00, TRUE, 1},
-	{"D_INT", 0x0E00, TRUE, 1},
-	{"D_TRAP", 0x0F00, TRUE, 1},
-	{"D_DATA", 0x1000, TRUE, 1},
-	{"D_CODE", 0x1800, TRUE, 1},
-	{"D_DPL3", 0x6000, TRUE, 1},
-	{"D_DPL2", 0x4000, TRUE, 1},
-	{"D_DPL1", 0x2000, TRUE, 1},
-	{"D_PRESENT", 0x8000, TRUE, 1},
-	{"D_NOT_PRESENT", 0x8000, TRUE, 1},
-	{"D_ACC", 0x100, TRUE, 1},
-	{"D_WRITE", 0x200, TRUE, 1},
-	{"D_READ", 0x200, TRUE, 1},
-	{"D_BUSY", 0x200, TRUE, 1},
-	{"D_EXDOWN", 0x400, TRUE, 1},
-	{"D_CONFORM", 0x400, TRUE, 1},
-	{"D_BIG", 0x40, TRUE, 1},
-	{"D_BIG_LIM", 0x80, TRUE, 1}
+	{"D_LDT", 0x200, TRUE, 0},
+	{"D_TASK", 0x500, TRUE, 0},
+	{"D_TSS", 0x900, TRUE, 0},
+	{"D_CALL", 0x0C00, TRUE, 0},
+	{"D_INT", 0x0E00, TRUE, 0},
+	{"D_TRAP", 0x0F00, TRUE, 0},
+	{"D_DATA", 0x1000, TRUE, 0},
+	{"D_CODE", 0x1800, TRUE, 0},
+	{"D_DPL3", 0x6000, TRUE, 0},
+	{"D_DPL2", 0x4000, TRUE, 0},
+	{"D_DPL1", 0x2000, TRUE, 0},
+	{"D_PRESENT", 0x8000, TRUE, 0},
+	{"D_NOT_PRESENT", 0x8000, TRUE, 0},
+	{"D_ACC", 0x100, TRUE, 0},
+	{"D_WRITE", 0x200, TRUE, 0},
+	{"D_READ", 0x200, TRUE, 0},
+	{"D_BUSY", 0x200, TRUE, 0},
+	{"D_EXDOWN", 0x400, TRUE, 0},
+	{"D_CONFORM", 0x400, TRUE, 0},
+	{"D_BIG", 0x40, TRUE, 0},
+	{"D_BIG_LIM", 0x80, TRUE, 0}
 };
 	
 
